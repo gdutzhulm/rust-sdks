@@ -19,6 +19,7 @@
 #if defined(__APPLE__)
 
 #include <CoreFoundation/CoreFoundation.h>
+#include <IOKit/IOKitLib.h>   // kIOReturnSuccess
 #include <IOSurface/IOSurface.h>
 #include <fcntl.h>
 #include <sys/mman.h>

@@ -40,6 +40,9 @@ jobs:
         with:
           target: x86_64-pc-windows-msvc
           cache: true
+          # **必须关掉默认的 -D warnings**：本仓库（含上游 device-info 等 crate）本身有一批 warning，
+          # 上游的 CI 也都是显式写 rustflags: ""。不关的话 3 个 job 全在 rustc 那里变错误（实测）。
+          rustflags: ""
       - uses: arduino/setup-protoc@v3
         with:
           version: '25.2'
@@ -76,6 +79,9 @@ jobs:
         with:
           target: aarch64-apple-darwin
           cache: true
+          # **必须关掉默认的 -D warnings**：本仓库（含上游 device-info 等 crate）本身有一批 warning，
+          # 上游的 CI 也都是显式写 rustflags: ""。不关的话 3 个 job 全在 rustc 那里变错误（实测）。
+          rustflags: ""
       - uses: arduino/setup-protoc@v3
         with:
           version: '25.2'
@@ -113,6 +119,9 @@ jobs:
         with:
           target: x86_64-apple-darwin
           cache: true
+          # **必须关掉默认的 -D warnings**：本仓库（含上游 device-info 等 crate）本身有一批 warning，
+          # 上游的 CI 也都是显式写 rustflags: ""。不关的话 3 个 job 全在 rustc 那里变错误（实测）。
+          rustflags: ""
       - uses: arduino/setup-protoc@v3
         with:
           version: '25.2'
