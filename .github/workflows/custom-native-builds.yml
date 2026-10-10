@@ -1,16 +1,16 @@
 # 定制原生库构建（Windows=D3D11 共享纹理 / macOS=IOSurface）
 #
-# 这个 workflow 只做一件事：在 CI 上把**我们定制过的** livekit_ffi 编出来，供本仓库
-# （MeettingCaptrue）的 SDK 使用：
-#   · windows-latest  → livekit_ffi.dll（D3D11 共享纹理 sink + 帧率上限 + 丢弃计数 + box 降采样）
-#   · macos-latest    → liblivekit_ffi.dylib（IOSurface sink，同样的限速/计数语义）
+# 只做一件事：在 CI 上把**我们定制过的** livekit_ffi 编出来，供 MeettingCaptrue 的 SDK 使用。
+#   · windows-latest → livekit_ffi.dll（D3D11 sink + 本端帧率上限 + 丢弃计数 + box 降采样）
+#   · macos-latest   → liblivekit_ffi.dylib（IOSurface sink，同样的限速/计数语义）
 #
-# webRTC 预编译**不需要手动准备**：webrtc-sys/build/src/lib.rs 会按 target 自动下载
-#   https://github.com/livekit/rust-sdks/releases/download/webrtc-51ef663/webrtc-<os>-<arch>-release.zip
-# 所以 runner 上只要 Rust + protoc 就够（Xcode / MSVC 都是 runner 自带的）。
+# 预编译 WebRTC 的来源：livekit 的 release 资产
+#   https://github.com/livekit/rust-sdks/releases/download/webrtc-51ef663/webrtc-<triple>.zip
+# **不依赖 webrtc-sys 内置的自动下载**（实测它在 CI 上会在 `resp.copy_to(...)` 处失败：
+#   "Failed to write WebRTC download to temporary file: error decoding response body"），
+# 这里改成显式 curl 下载（带重试）+ 解压 + 用 LK_CUSTOM_WEBRTC 指过去，和本地构建同一套路径。
 #
-# 用法：改完 webrtc-sys / libwebrtc / livekit-ffi 推上来即自动跑；也可以手动 Run workflow。
-# 产物在本次 run 的 Artifacts 里下载，然后：
+# 产物在本次 run 的 Artifacts 里：
 #   livekit_ffi.dll      → LiveKit.Client.Sdk/runtimes/win-x64/native/
 #   liblivekit_ffi.dylib → LiveKit.Client.Sdk/runtimes/{osx-arm64|osx-x64}/native/
 
@@ -28,7 +28,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  PROFILE: release
+  WEBRTC_TAG: webrtc-51ef663
 
 jobs:
   windows-x64:
@@ -40,35 +40,61 @@ jobs:
         with:
           target: x86_64-pc-windows-msvc
           cache: true
-          # **必须关掉默认的 -D warnings**：本仓库（含上游 device-info 等 crate）本身有一批 warning，
-          # 上游的 CI 也都是显式写 rustflags: ""。不关的话 3 个 job 全在 rustc 那里变错误（实测）。
+          # 关掉默认的 -D warnings：本仓库（含上游 device-info 等）自带一批 warning，
+          # 不关的话 rustc 的 warning 会被当成错误（实测 3 个 job 全挂在这上面）。
           rustflags: ""
       - uses: arduino/setup-protoc@v3
         with:
           version: '25.2'
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build livekit-ffi (${{ env.PROFILE }})
-        run: cargo build -p livekit-ffi --release --target x86_64-pc-windows-msvc
+      - name: Download prebuilt WebRTC
+        shell: pwsh
+        run: |
+          $triple = 'win-x64-release'
+          $zip = 'webrtc.zip'
+          curl.exe -sSL --retry 5 --retry-all-errors -o $zip "$env:WEBRTC_BASE/webrtc-$triple.zip"
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::下载 WebRTC 失败（curl 退出码 $LASTEXITCODE）"; exit 1 }
+          New-Item -ItemType Directory -Force webrtc | Out-Null
+          tar -xf $zip -C webrtc
+          $ninja = Get-ChildItem -Path webrtc -Recurse -Filter webrtc.ninja | Select-Object -First 1
+          if (-not $ninja) { Write-Host "::error::解压后找不到 webrtc.ninja"; Get-ChildItem -Recurse webrtc | Select-Object -First 30 FullName; exit 1 }
+          "LK_CUSTOM_WEBRTC=$($ninja.DirectoryName)" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          Write-Host "LK_CUSTOM_WEBRTC=$($ninja.DirectoryName)"
+          Get-ChildItem $ninja.DirectoryName | Select-Object Name, Length
+        env:
+          WEBRTC_BASE: https://github.com/livekit/rust-sdks/releases/download/${{ env.WEBRTC_TAG }}
 
-      # 冒烟测试（D3D11 sink）：建共享纹理、上下翻转、帧号、限速丢帧、丢弃计数。
-      # 失败不阻塞产物上传，但会在日志里标记出来（CI 里没有真实摄像头/对端，只跑协议级用例）。
+      - name: Build livekit-ffi (release)
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo build -p livekit-ffi --release --target x86_64-pc-windows-msvc 2>&1 | tee build.log
+          rc=${PIPESTATUS[0]}
+          if [ $rc -ne 0 ]; then
+            echo "::error::cargo build 失败（exit $rc），下面是最后 40 行："
+            tail -n 40 build.log | while IFS= read -r line; do echo "::error::$line"; done
+          fi
+          exit $rc
+
       - name: Smoke test webrtc-sys
         continue-on-error: true
-        run: cargo test -p webrtc-sys --release --target x86_64-pc-windows-msvc -- --nocapture --test-threads=1
+        shell: bash
+        run: cargo test -p webrtc-sys --release --target x86_64-pc-windows-msvc -- --nocapture --test-threads=1 2>&1 | tail -n 60
 
       - name: Check artifact
         shell: pwsh
         run: |
           $p = 'target/x86_64-pc-windows-msvc/release/livekit_ffi.dll'
-          if (-not (Test-Path $p)) { throw "缺少产物：$p" }
+          if (-not (Test-Path $p)) { Write-Host "::error::缺少产物 $p"; exit 1 }
           Get-Item $p | Select-Object FullName, Length, LastWriteTime
 
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: livekit_ffi-windows-x64
           path: target/x86_64-pc-windows-msvc/release/livekit_ffi.dll
-          if-no-files-found: error
+          if-no-files-found: warn
 
   macos-arm64:
     name: macOS arm64 (IOSurface sink)
@@ -79,36 +105,55 @@ jobs:
         with:
           target: aarch64-apple-darwin
           cache: true
-          # **必须关掉默认的 -D warnings**：本仓库（含上游 device-info 等 crate）本身有一批 warning，
-          # 上游的 CI 也都是显式写 rustflags: ""。不关的话 3 个 job 全在 rustc 那里变错误（实测）。
           rustflags: ""
       - uses: arduino/setup-protoc@v3
         with:
           version: '25.2'
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build livekit-ffi (${{ env.PROFILE }})
-        env:
-          MACOSX_DEPLOYMENT_TARGET: '11.0'   # aarch64 最低 11
-        run: cargo build -p livekit-ffi --release --target aarch64-apple-darwin
+      - name: Download prebuilt WebRTC
+        run: |
+          set -e
+          triple=mac-arm64-release
+          curl -sSL --retry 5 --retry-all-errors -o webrtc.zip \
+            "https://github.com/livekit/rust-sdks/releases/download/$WEBRTC_TAG/webrtc-$triple.zip"
+          mkdir -p webrtc && tar -xf webrtc.zip -C webrtc
+          ninja=$(find webrtc -name webrtc.ninja | head -n1 || true)
+          if [ -z "$ninja" ]; then echo "::error::解压后找不到 webrtc.ninja"; ls -R webrtc | head -50; exit 1; fi
+          root=$(dirname "$ninja")
+          echo "LK_CUSTOM_WEBRTC=$PWD/$root" >> $GITHUB_ENV
+          echo "LK_CUSTOM_WEBRTC=$PWD/$root"
+          ls -l "$root"
 
-      # IOSurface sink 的冒烟测试：建 surface、自上而下写、帧号、限速丢帧、丢弃计数。
-      # 注意：老版 mac / 某些虚拟机里 IOSurfaceCreate 可能不可用 —— 失败不阻塞产物。
+      - name: Build livekit-ffi (release)
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '11.0'
+        run: |
+          set -o pipefail
+          cargo build -p livekit-ffi --release --target aarch64-apple-darwin 2>&1 | tee build.log
+          rc=${PIPESTATUS[0]}
+          if [ $rc -ne 0 ]; then
+            echo "::error::cargo build 失败（exit $rc），下面是最后 40 行："
+            tail -n 40 build.log | while IFS= read -r line; do echo "::error::$line"; done
+          fi
+          exit $rc
+
       - name: Smoke test webrtc-sys
         continue-on-error: true
-        run: cargo test -p webrtc-sys --release --target aarch64-apple-darwin -- --nocapture --test-threads=1
+        run: cargo test -p webrtc-sys --release --target aarch64-apple-darwin -- --nocapture --test-threads=1 2>&1 | tail -n 60
 
       - name: Check artifact
         run: |
           f=target/aarch64-apple-darwin/release/liblivekit_ffi.dylib
-          test -f "$f" || { echo "缺少产物：$f"; exit 1; }
+          test -f "$f" || { echo "::error::缺少产物 $f"; exit 1; }
           ls -l "$f"
 
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: liblivekit_ffi-macos-arm64
           path: target/aarch64-apple-darwin/release/liblivekit_ffi.dylib
-          if-no-files-found: error
+          if-no-files-found: warn
 
   macos-x64:
     name: macOS x64 (IOSurface sink, 交叉编译)
@@ -119,27 +164,48 @@ jobs:
         with:
           target: x86_64-apple-darwin
           cache: true
-          # **必须关掉默认的 -D warnings**：本仓库（含上游 device-info 等 crate）本身有一批 warning，
-          # 上游的 CI 也都是显式写 rustflags: ""。不关的话 3 个 job 全在 rustc 那里变错误（实测）。
           rustflags: ""
       - uses: arduino/setup-protoc@v3
         with:
           version: '25.2'
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build livekit-ffi (${{ env.PROFILE }})
+      - name: Download prebuilt WebRTC
+        run: |
+          set -e
+          triple=mac-x64-release
+          curl -sSL --retry 5 --retry-all-errors -o webrtc.zip \
+            "https://github.com/livekit/rust-sdks/releases/download/$WEBRTC_TAG/webrtc-$triple.zip"
+          mkdir -p webrtc && tar -xf webrtc.zip -C webrtc
+          ninja=$(find webrtc -name webrtc.ninja | head -n1 || true)
+          if [ -z "$ninja" ]; then echo "::error::解压后找不到 webrtc.ninja"; ls -R webrtc | head -50; exit 1; fi
+          root=$(dirname "$ninja")
+          echo "LK_CUSTOM_WEBRTC=$PWD/$root" >> $GITHUB_ENV
+          echo "LK_CUSTOM_WEBRTC=$PWD/$root"
+          ls -l "$root"
+
+      - name: Build livekit-ffi (release)
         env:
           MACOSX_DEPLOYMENT_TARGET: '10.15'
-        run: cargo build -p livekit-ffi --release --target x86_64-apple-darwin
+        run: |
+          set -o pipefail
+          cargo build -p livekit-ffi --release --target x86_64-apple-darwin 2>&1 | tee build.log
+          rc=${PIPESTATUS[0]}
+          if [ $rc -ne 0 ]; then
+            echo "::error::cargo build 失败（exit $rc），下面是最后 40 行："
+            tail -n 40 build.log | while IFS= read -r line; do echo "::error::$line"; done
+          fi
+          exit $rc
 
       - name: Check artifact
         run: |
           f=target/x86_64-apple-darwin/release/liblivekit_ffi.dylib
-          test -f "$f" || { echo "缺少产物：$f"; exit 1; }
+          test -f "$f" || { echo "::error::缺少产物 $f"; exit 1; }
           ls -l "$f"
 
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: liblivekit_ffi-macos-x64
           path: target/x86_64-apple-darwin/release/liblivekit_ffi.dylib
-          if-no-files-found: error
+          if-no-files-found: warn
