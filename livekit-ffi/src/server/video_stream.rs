@@ -100,7 +100,18 @@ impl FfiVideoStream {
             proto::VideoStreamType::VideoStreamD3d11Texture => {
                 let texture_width = new_stream.texture_width.unwrap_or(1920).max(2);
                 let texture_height = new_stream.texture_height.unwrap_or(1080).max(2);
-                let d3d11_stream = D3D11VideoStream::new(rtc_track, texture_width, texture_height);
+                // 本端（观看侧）写纹理限速：0 = 不限。C# 侧按 `Video:GpuTextureShareMaxFps` /
+                // `Video:GpuTextureCameraMaxFps` 传进来，让"转换 + 上传 + 合成拷贝"的次数跟着**本端写入帧率**
+                // 走（VDI 上这是 CPU 大头），而**不影响对端推流**（对端推多少都照收照解码）。
+                let max_fps = new_stream.max_fps.unwrap_or(0);
+                let d3d11_stream =
+                    D3D11VideoStream::new(rtc_track, texture_width, texture_height, max_fps);
+                log::info!(
+                    "D3D11 shared texture stream: {}x{}, max_fps={} (0 = unlimited)",
+                    texture_width,
+                    texture_height,
+                    max_fps
+                );
                 if !d3d11_stream.valid() {
                     return Err(FfiError::InvalidRequest("failed to create D3D11 video sink".into()));
                 }

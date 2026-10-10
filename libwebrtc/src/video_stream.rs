@@ -29,8 +29,13 @@ pub mod d3d11 {
     }
 
     impl D3D11VideoStream {
-        pub fn new(video_track: RtcVideoTrack, width: u32, height: u32) -> Self {
-            let sink = sys_d3d11::ffi::new_d3d11_video_sink(width, height);
+        pub fn new(
+            video_track: RtcVideoTrack,
+            width: u32,
+            height: u32,
+            max_fps: u32,
+        ) -> Self {
+            let sink = sys_d3d11::ffi::new_d3d11_video_sink(width, height, max_fps);
             let video = unsafe { sys_vt::ffi::media_to_video(video_track.sys_handle()) };
             video.add_d3d11_sink(&sink);
             Self { sink, video_track }
@@ -46,6 +51,10 @@ pub mod d3d11 {
 
         pub fn height(&self) -> u32 {
             self.sink.height()
+        }
+
+        pub fn max_fps(&self) -> u32 {
+            self.sink.max_fps()
         }
 
         pub fn valid(&self) -> bool {

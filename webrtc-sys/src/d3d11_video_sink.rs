@@ -23,7 +23,11 @@ pub mod ffi {
         type VideoTrack = crate::video_track::ffi::VideoTrack;
         type D3D11VideoSink;
 
-        fn new_d3d11_video_sink(width: u32, height: u32) -> SharedPtr<D3D11VideoSink>;
+        fn new_d3d11_video_sink(
+            width: u32,
+            height: u32,
+            max_fps: u32,
+        ) -> SharedPtr<D3D11VideoSink>;
         fn add_d3d11_sink(
             self: &VideoTrack,
             sink: &SharedPtr<D3D11VideoSink>,
@@ -35,6 +39,7 @@ pub mod ffi {
         fn shared_handle(self: &D3D11VideoSink) -> u64;
         fn width(self: &D3D11VideoSink) -> u32;
         fn height(self: &D3D11VideoSink) -> u32;
+        fn max_fps(self: &D3D11VideoSink) -> u32;
         fn valid(self: &D3D11VideoSink) -> bool;
         fn set_producer_active(self: &D3D11VideoSink, active: bool);
         fn retire_d3d11_video_sink(sink: &SharedPtr<D3D11VideoSink>);
@@ -52,6 +57,11 @@ pub mod ffi {
             bottom_left_pixel: &mut u32,
         ) -> bool;
         fn test_frame_counter(sink: &SharedPtr<D3D11VideoSink>) -> i32;
+        fn test_read_drop_counters(
+            sink: &SharedPtr<D3D11VideoSink>,
+            rate_limited: &mut i32,
+            consumer_absent: &mut i32,
+        ) -> bool;
     }
 }
 
@@ -62,7 +72,7 @@ mod tests {
 
     #[test]
     fn creates_d3d11_shared_texture() {
-        let sink = ffi::new_d3d11_video_sink(1920, 1080);
+        let sink = ffi::new_d3d11_video_sink(1920, 1080, 0);
         assert!(sink.valid());
         assert_ne!(sink.shared_handle(), 0);
     }
@@ -74,7 +84,7 @@ mod tests {
     /// libyuv 的负 height 让它在转换里顺手完成；这个用例就是防止那次改写把画面弄倒。
     #[test]
     fn shared_texture_flip_and_frame_counter() {
-        let sink = ffi::new_d3d11_video_sink(64, 32);
+        let sink = ffi::new_d3d11_video_sink(64, 32, 0);
         assert!(sink.valid());
 
         // 构造函数写过一帧黑色并把钥匙交给了消费端；消费端先"显示"一次。
@@ -107,6 +117,41 @@ mod tests {
             2,
             "生产端应能持续写帧"
         );
+    }
+
+    /// 生产端限速：max_fps 生效时，限速窗口内的帧**在转换之前**就被丢掉
+    /// （连 I420->BGRA 都不做），所以帧序号不动 —— VDI 上 CPU 按显示帧率走。
+    #[test]
+    fn max_fps_drops_frames_before_conversion() {
+        let sink = ffi::new_d3d11_video_sink(64, 32, 1); // 1fps -> 两帧至少隔 1s
+        assert!(sink.valid());
+        assert_eq!(sink.max_fps(), 1);
+
+        assert!(ffi::test_consume_once(&sink));
+
+        ffi::test_feed_split_frame(&sink, 64, 32);
+        assert_eq!(
+            ffi::test_frame_counter(&sink),
+            1,
+            "限速窗口内的第一帧应该写进去"
+        );
+
+        ffi::test_feed_split_frame(&sink, 64, 32);
+        assert_eq!(
+            ffi::test_frame_counter(&sink),
+            1,
+            "1s 内的第二帧应该被限速丢掉（帧序号不涨）"
+        );
+
+        // 更要紧的是"丢了多少"能报出来（C# 用它算 到 sink 的帧数 ≈ 写入 + 限速丢 + 无宿主丢）
+        let (mut rate_limited, mut consumer_absent) = (-1i32, -1i32);
+        assert!(ffi::test_read_drop_counters(
+            &sink,
+            &mut rate_limited,
+            &mut consumer_absent
+        ));
+        assert_eq!(rate_limited, 1, "被限速丢掉的那一帧应该计数");
+        assert_eq!(consumer_absent, 0, "消费端在场时不该记「无宿主丢弃」");
     }
 
     fn unpack(pixel: u32) -> (u8, u8, u8) {

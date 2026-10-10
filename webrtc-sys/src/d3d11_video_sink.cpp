@@ -53,6 +53,19 @@ D3D_DRIVER_TYPE DriverCandidates[] = {
 constexpr double kConsumerAbsentBackoffMs = 200.0;
 constexpr DWORD kAcquireTimeoutMs = 50;
 
+// 帧计数共享内存（frame_view_）的布局：LONG 数组，C# 侧读它做 [GpuPresent] 诊断。
+//   0 = 已写成的帧号（消费端只在它变化时才去动合成 surface）
+//   1 = producer_active（消费端在不在场：0 = 没人看，原生连锁都不抢）
+//   2 = 限速丢弃：被 max_fps 挡在**转换之前**的帧数（"到了但没转"的那部分）
+//   3 = 消费端不在场丢弃：producer_active=0 或退避期丢掉的帧数
+// 于是 C# 侧可以算出一个"到 sink 的帧数 ≈ 写入 + 限速丢 + 无宿主丢"，
+// 一眼看出"远端推了多少、本端只转了多少"（VDI 上最关心的那笔账）。
+constexpr int kFrameSlotCount = 4;
+constexpr int kFrameIdSlot = 0;
+constexpr int kProducerActiveSlot = 1;
+constexpr int kRateLimitedDropSlot = 2;
+constexpr int kConsumerAbsentDropSlot = 3;
+
 double now_ms() {
   using namespace std::chrono;
   return duration<double, std::milli>(steady_clock::now().time_since_epoch())
@@ -61,9 +74,13 @@ double now_ms() {
 
 }  // namespace
 
-D3D11VideoSink::D3D11VideoSink(uint32_t width, uint32_t height)
+D3D11VideoSink::D3D11VideoSink(uint32_t width, uint32_t height,
+                               uint32_t max_fps)
     : width_(std::max<uint32_t>(2, width & ~1u)),
       height_(std::max<uint32_t>(2, height & ~1u)),
+      max_fps_(max_fps),
+      min_interval_ms_(
+          max_fps > 0 ? 1000.0 / static_cast<double>(max_fps) : 0.0),
       frame_mutex_(new std::mutex()),
       scale_y_(new std::vector<uint8_t>()),
       scale_u_(new std::vector<uint8_t>()),
@@ -151,14 +168,18 @@ D3D11VideoSink::D3D11VideoSink(uint32_t width, uint32_t height)
   swprintf_s(frame_mapping_name, L"Local\\LiveKitGpuFrame_%016llX",
              static_cast<unsigned long long>(shared_handle_));
   frame_mapping_ = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr,
-                                      PAGE_READWRITE, 0, sizeof(LONG) * 2,
+                                      PAGE_READWRITE, 0,
+                                      sizeof(LONG) * kFrameSlotCount,
                                       frame_mapping_name);
   if (frame_mapping_ != nullptr) {
     frame_view_ = MapViewOfFile(frame_mapping_, FILE_MAP_ALL_ACCESS, 0, 0,
-                                sizeof(LONG) * 2);
+                                sizeof(LONG) * kFrameSlotCount);
     if (frame_view_ != nullptr) {
-      static_cast<volatile LONG*>(frame_view_)[0] = 0;
-      static_cast<volatile LONG*>(frame_view_)[1] = 1;
+      auto* slots = static_cast<volatile LONG*>(frame_view_);
+      slots[kFrameIdSlot] = 0;
+      slots[kProducerActiveSlot] = 1;
+      slots[kRateLimitedDropSlot] = 0;
+      slots[kConsumerAbsentDropSlot] = 0;
     }
   }
 
@@ -210,7 +231,13 @@ void D3D11VideoSink::ReleaseResources() {
 
 void D3D11VideoSink::set_producer_active(bool active) const {
   if (frame_view_ != nullptr) {
-    static_cast<volatile LONG*>(frame_view_)[1] = active ? 1 : 0;
+    static_cast<volatile LONG*>(frame_view_)[kProducerActiveSlot] = active ? 1 : 0;
+  }
+}
+
+void D3D11VideoSink::CountDrop(int slot) const {
+  if (frame_view_ != nullptr) {
+    InterlockedIncrement(static_cast<volatile LONG*>(frame_view_) + slot);
   }
 }
 
@@ -245,14 +272,27 @@ void D3D11VideoSink::OnFrame(const webrtc::VideoFrame& frame) {
   }
 
   std::lock_guard<std::mutex> lock(*static_cast<std::mutex*>(frame_mutex_));
-  if (!valid_ || frame_view_ == nullptr ||
-      static_cast<volatile LONG*>(frame_view_)[1] == 0) {
+  if (!valid_ || frame_view_ == nullptr) {
+    return;
+  }
+  if (static_cast<volatile LONG*>(frame_view_)[kProducerActiveSlot] == 0) {
+    CountDrop(kConsumerAbsentDropSlot);   // 本端明确表示"没人看这块纹理"
     return;
   }
 
   // 消费端不在场时已经退避：直接丢掉这一帧（连 I420 转换都不做），
   // 别把 WebRTC 的视频线程耗在没人看的帧上。
   if (now_ms() < skip_until_ms_) {
+    CountDrop(kConsumerAbsentDropSlot);
+    return;
+  }
+
+  // 本端（观看侧）写纹理限速（max_fps>0 时）：还没到下一次允许写纹理的时间 -> 整帧丢掉。
+  // **只影响本端显示**：对端照它自己的配置推流（60fps 也照收照解码），这里丢的是"解码之后"的帧。
+  // 这一条**必须在转换之前**：VDI 上"每帧 I420->BGRA + 10MB 级上传"才是 CPU 大头，
+  // 对端推 30~60fps、本端只显示 15fps 时，剩下的转换与上传全是白烧的 CPU。
+  if (min_interval_ms_ > 0 && now_ms() - last_write_ms_ < min_interval_ms_) {
+    CountDrop(kRateLimitedDropSlot);
     return;
   }
 
@@ -294,6 +334,14 @@ void D3D11VideoSink::OnFrame(const webrtc::VideoFrame& frame) {
   //   · 画面占满整块纹理 → 跳过"铺黑边"的一次全纹理清零；
   //   · 上下翻转交给 libyuv 的**负 stride**（自下而上写）完成，省掉原来那次 11MB 的整帧行交换。
   const bool needs_scale = dst_width != src_width || dst_height != src_height;
+  // 缩放核：**缩小**（源比纹理大）时用 box（面积平均）—— 它是"降采样"的正确核，
+  // 文字边缘不会像双线性那样出现明暗闪烁的锯齿；1:1 或放大时用线性（更锐）。
+  // 阈值取 2.0：只有真正的降采样（例如竖屏 1156x2510 → 496x1080 是 2.3x）才换核，
+  // 轻微缩小（如 1080p → 720 的 1.5x）仍保持原来的观感。
+  const double downscale_ratio =
+      static_cast<double>(src_width) / static_cast<double>(dst_width);
+  const libyuv::FilterMode scale_filter =
+      downscale_ratio >= 2.0 ? libyuv::kFilterBox : libyuv::kFilterLinear;
   const bool needs_clear = dst_width != static_cast<int>(width_) ||
                            dst_height != static_cast<int>(height_);
 
@@ -319,7 +367,7 @@ void D3D11VideoSink::OnFrame(const webrtc::VideoFrame& frame) {
         i420->DataY(), i420->StrideY(), i420->DataU(), i420->StrideU(),
         i420->DataV(), i420->StrideV(), src_width, src_height, scaled_y.data(),
         dst_width, scaled_u.data(), dst_chroma_stride, scaled_v.data(),
-        dst_chroma_stride, dst_width, dst_height, libyuv::kFilterLinear);
+        dst_chroma_stride, dst_width, dst_height, scale_filter);
 
     plane_y = scaled_y.data();
     plane_u = scaled_u.data();
@@ -356,8 +404,9 @@ void D3D11VideoSink::OnFrame(const webrtc::VideoFrame& frame) {
   (*context)->UpdateSubresource(texture->Get(), 0, nullptr, bgra.data(),
                                 static_cast<UINT>(width_) * 4, 0);
   (*mutex)->ReleaseSync(1);
+  last_write_ms_ = now_ms();
   if (frame_view_ != nullptr) {
-    InterlockedIncrement(static_cast<volatile LONG*>(frame_view_));
+    InterlockedIncrement(static_cast<volatile LONG*>(frame_view_) + kFrameIdSlot);
   }
 }
 
@@ -488,12 +537,25 @@ int32_t test_frame_counter(const std::shared_ptr<D3D11VideoSink>& sink) {
   if (!sink || sink->frame_view_ == nullptr) {
     return -1;
   }
-  return static_cast<volatile LONG*>(sink->frame_view_)[0];
+  return static_cast<volatile LONG*>(sink->frame_view_)[kFrameIdSlot];
+}
+
+bool test_read_drop_counters(const std::shared_ptr<D3D11VideoSink>& sink,
+                             int32_t& rate_limited,
+                             int32_t& consumer_absent) {
+  if (!sink || sink->frame_view_ == nullptr) {
+    return false;
+  }
+  auto* slots = static_cast<volatile LONG*>(sink->frame_view_);
+  rate_limited = slots[kRateLimitedDropSlot];
+  consumer_absent = slots[kConsumerAbsentDropSlot];
+  return true;
 }
 
 uint64_t D3D11VideoSink::shared_handle() const { return shared_handle_; }
 uint32_t D3D11VideoSink::width() const { return width_; }
 uint32_t D3D11VideoSink::height() const { return height_; }
+uint32_t D3D11VideoSink::max_fps() const { return max_fps_; }
 bool D3D11VideoSink::valid() const { return valid_; }
 
 void retire_d3d11_video_sink(
@@ -510,8 +572,9 @@ void retire_d3d11_video_sink(
 
 
 std::shared_ptr<D3D11VideoSink> new_d3d11_video_sink(uint32_t width,
-                                                    uint32_t height) {
-  return std::make_shared<D3D11VideoSink>(width, height);
+                                                    uint32_t height,
+                                                    uint32_t max_fps) {
+  return std::make_shared<D3D11VideoSink>(width, height, max_fps);
 }
 
 }  // namespace livekit_ffi

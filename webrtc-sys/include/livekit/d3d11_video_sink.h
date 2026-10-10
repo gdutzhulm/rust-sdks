@@ -28,7 +28,7 @@ namespace livekit_ffi {
 /// interop API. Only implemented on Windows.
 class D3D11VideoSink : public webrtc::VideoSinkInterface<webrtc::VideoFrame> {
  public:
-  D3D11VideoSink(uint32_t width, uint32_t height);
+  D3D11VideoSink(uint32_t width, uint32_t height, uint32_t max_fps);
   ~D3D11VideoSink() override;
 
   void OnFrame(const webrtc::VideoFrame& frame) override;
@@ -37,6 +37,7 @@ class D3D11VideoSink : public webrtc::VideoSinkInterface<webrtc::VideoFrame> {
   uint64_t shared_handle() const;
   uint32_t width() const;
   uint32_t height() const;
+  uint32_t max_fps() const;
   bool valid() const;
 
   void set_producer_active(bool active) const;
@@ -45,17 +46,30 @@ class D3D11VideoSink : public webrtc::VideoSinkInterface<webrtc::VideoFrame> {
  private:
   void ReleaseResources();
 
+  /// 记一次"丢掉"（写共享内存里的计数，C# 用它算"到 sink 的帧数 vs 实际写入帧数"）。
+  /// slot 布局见 cpp 里的 kFrameSlotCount 说明。
+  void CountDrop(int slot) const;
+
   uint32_t width_ = 0;
   uint32_t height_ = 0;
   bool valid_ = false;
+
+  // 生产端限速（0 = 不限）：两次"写成一帧"之间至少隔 min_interval_ms_。
+  // 判断放在**转换之前** —— 被丢的帧连 I420->BGRA 与上传都不做，所以
+  // VDI（无独显、Avalonia 走软渲染）上这条路的成本与**显示帧率**成正比，
+  // 而不是与"远端推流帧率"（实测 30~40fps）成正比。
+  uint32_t max_fps_ = 0;
+  double min_interval_ms_ = 0;
+  double last_write_ms_ = 0;
   void* device_ = nullptr;
   void* context_ = nullptr;
   void* texture_ = nullptr;
   void* keyed_mutex_ = nullptr;
   uint64_t shared_handle_ = 0;
 
-  // 命名共享内存中的帧序号：C# 只在序号变化时刷新 Composition surface，
-  // 避免原生暂停出帧时 C# 一直等待 keyed mutex。
+  // 命名共享内存：4 个 LONG（帧序号 / producer_active / 限速丢弃 / 消费端不在场丢弃）。
+  // C# 只在帧序号变化时才去刷新 Composition surface，避免原生暂停出帧时 C# 一直等 keyed mutex；
+  // 另外两个计数给 C# 算"到 sink 的帧数 ≈ 写入 + 限速丢 + 无宿主丢"（VDI 上最关心的那笔账）。
   void* frame_mapping_ = nullptr;
   void* frame_view_ = nullptr;
 
@@ -82,6 +96,9 @@ class D3D11VideoSink : public webrtc::VideoSinkInterface<webrtc::VideoFrame> {
                                 uint32_t& top_left_pixel,
                                 uint32_t& bottom_left_pixel);
   friend int32_t test_frame_counter(const std::shared_ptr<D3D11VideoSink>& sink);
+  friend bool test_read_drop_counters(const std::shared_ptr<D3D11VideoSink>& sink,
+                                      int32_t& rate_limited,
+                                      int32_t& consumer_absent);
 };
 
 // ---- 冒烟测试支持（正式路径不使用）----
@@ -108,9 +125,15 @@ bool test_read_texture(const std::shared_ptr<D3D11VideoSink>& sink,
 /// 读共享内存里的帧序号（原生每写成一帧 +1）。
 int32_t test_frame_counter(const std::shared_ptr<D3D11VideoSink>& sink);
 
+/// 读共享内存里的丢弃计数：被限速挡在转换之前的 / 消费端不在场丢掉的。
+bool test_read_drop_counters(const std::shared_ptr<D3D11VideoSink>& sink,
+                             int32_t& rate_limited,
+                             int32_t& consumer_absent);
+
 void retire_d3d11_video_sink(const std::shared_ptr<D3D11VideoSink>& sink);
 
 std::shared_ptr<D3D11VideoSink> new_d3d11_video_sink(uint32_t width,
-                                                    uint32_t height);
+                                                    uint32_t height,
+                                                    uint32_t max_fps);
 
 }  // namespace livekit_ffi

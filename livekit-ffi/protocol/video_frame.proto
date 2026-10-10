@@ -41,6 +41,19 @@ message NewVideoStreamRequest {
   // the native side may choose a default.
   optional uint32 texture_width = 6;
   optional uint32 texture_height = 7;
+  // Optional **local (viewer-side)** frame-rate cap for the D3D11 texture
+  // stream: how often THIS process writes a decoded frame into its shared
+  // texture. It is not a publisher setting and is never signalled to the
+  // remote peer - the sender (including mobile clients publishing 30-60 fps)
+  // keeps streaming at its own rate and we keep receiving and DECODING every
+  // frame. The sink only stops converting/uploading what it cannot show: the
+  // frame is dropped **before** any conversion (no I420 scale, no
+  // I420 -> BGRA, no upload) while the interval since the last written frame
+  // is shorter than 1000/max_fps ms. On software-rendered machines (VDI
+  // without a GPU) the "convert + upload + composite copy" cost then scales
+  // with the local write rate instead of the incoming stream rate.
+  // 0 or omitted = no cap.
+  optional uint32 max_fps = 8;
 }
 message NewVideoStreamResponse { required OwnedVideoStream stream = 1; }
 
