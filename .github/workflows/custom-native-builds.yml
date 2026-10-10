@@ -4,11 +4,11 @@
 #   · windows-latest → livekit_ffi.dll（D3D11 sink + 本端帧率上限 + 丢弃计数 + box 降采样）
 #   · macos-latest   → liblivekit_ffi.dylib（IOSurface sink，同样的限速/计数语义）
 #
-# 预编译 WebRTC 的来源：livekit 的 release 资产
+# 预编译 WebRTC 显式下载（不依赖 webrtc-sys 内置下载：实测它在 CI 上会在 resp.copy_to(...) 处失败，
+# "Failed to write WebRTC download to temporary file: error decoding response body"）：
 #   https://github.com/livekit/rust-sdks/releases/download/webrtc-51ef663/webrtc-<triple>.zip
-# **不依赖 webrtc-sys 内置的自动下载**（实测它在 CI 上会在 `resp.copy_to(...)` 处失败：
-#   "Failed to write WebRTC download to temporary file: error decoding response body"），
-# 这里改成显式 curl 下载（带重试）+ 解压 + 用 LK_CUSTOM_WEBRTC 指过去，和本地构建同一套路径。
+#
+# 失败时会把 build.log 的尾巴写成 commit 评论（"Report failure" 步骤），方便直接定位。
 #
 # 产物在本次 run 的 Artifacts 里：
 #   livekit_ffi.dll      → LiveKit.Client.Sdk/runtimes/win-x64/native/
@@ -26,11 +26,14 @@ on:
       - '.github/workflows/custom-native-builds.yml'
   workflow_dispatch:
 
+permissions:
+  contents: write   # 只为失败时写 commit 评论
+
 env:
   CARGO_TERM_COLOR: always
   WEBRTC_TAG: webrtc-51ef663
-
 jobs:
+
   windows-x64:
     name: Windows x64 (D3D11 sink)
     runs-on: windows-latest
@@ -40,30 +43,27 @@ jobs:
         with:
           target: x86_64-pc-windows-msvc
           cache: true
-          # 关掉默认的 -D warnings：本仓库（含上游 device-info 等）自带一批 warning，
-          # 不关的话 rustc 的 warning 会被当成错误（实测 3 个 job 全挂在这上面）。
           rustflags: ""
       - uses: arduino/setup-protoc@v3
         with:
           version: '25.2'
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Download prebuilt WebRTC
+      - name: Download prebuilt WebRTC (Windows)
         shell: pwsh
+        env:
+          WEBRTC_BASE: https://github.com/livekit/rust-sdks/releases/download/${{ env.WEBRTC_TAG }}
         run: |
           $triple = 'win-x64-release'
-          $zip = 'webrtc.zip'
-          curl.exe -sSL --retry 5 --retry-all-errors -o $zip "$env:WEBRTC_BASE/webrtc-$triple.zip"
-          if ($LASTEXITCODE -ne 0) { Write-Host "::error::下载 WebRTC 失败（curl 退出码 $LASTEXITCODE）"; exit 1 }
+          curl.exe -sSL --retry 5 --retry-all-errors -o webrtc.zip "$env:WEBRTC_BASE/webrtc-$triple.zip"
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::下载 WebRTC 失败"; exit 1 }
           New-Item -ItemType Directory -Force webrtc | Out-Null
-          tar -xf $zip -C webrtc
+          tar -xf webrtc.zip -C webrtc
           $ninja = Get-ChildItem -Path webrtc -Recurse -Filter webrtc.ninja | Select-Object -First 1
-          if (-not $ninja) { Write-Host "::error::解压后找不到 webrtc.ninja"; Get-ChildItem -Recurse webrtc | Select-Object -First 30 FullName; exit 1 }
+          if (-not $ninja) { Write-Host "::error::解压后找不到 webrtc.ninja"; exit 1 }
           "LK_CUSTOM_WEBRTC=$($ninja.DirectoryName)" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
           Write-Host "LK_CUSTOM_WEBRTC=$($ninja.DirectoryName)"
           Get-ChildItem $ninja.DirectoryName | Select-Object Name, Length
-        env:
-          WEBRTC_BASE: https://github.com/livekit/rust-sdks/releases/download/${{ env.WEBRTC_TAG }}
 
       - name: Build livekit-ffi (release)
         shell: bash
@@ -71,10 +71,7 @@ jobs:
           set -o pipefail
           cargo build -p livekit-ffi --release --target x86_64-pc-windows-msvc 2>&1 | tee build.log
           rc=${PIPESTATUS[0]}
-          if [ $rc -ne 0 ]; then
-            echo "::error::cargo build 失败（exit $rc），下面是最后 40 行："
-            tail -n 40 build.log | while IFS= read -r line; do echo "::error::$line"; done
-          fi
+          if [ $rc -ne 0 ]; then echo "::error::cargo build 失败（exit $rc）"; fi
           exit $rc
 
       - name: Smoke test webrtc-sys
@@ -95,6 +92,28 @@ jobs:
           name: livekit_ffi-windows-x64
           path: target/x86_64-pc-windows-msvc/release/livekit_ffi.dll
           if-no-files-found: warn
+
+      - name: Report failure
+        if: failure()
+        shell: bash
+        env:
+          GH_TOKEN: ${ secrets.GITHUB_TOKEN }
+          JOB_NAME: Windows x64 (D3D11 sink)
+        run: |
+          {
+            echo "### $JOB_NAME 失败"
+            echo
+            echo "- LK_CUSTOM_WEBRTC=${LK_CUSTOM_WEBRTC}"
+            ls -l webrtc.zip 2>/dev/null || echo "(没有 webrtc.zip)"
+            echo
+            echo '```'
+            tail -n 60 build.log 2>/dev/null || echo "(没有 build.log)"
+            echo '```'
+          } > report.md
+          cat report.md
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/comments" \\
+            -f body="$(cat report.md)" >/dev/null 2>&1 || echo "（提交评论失败，忽略）"
+
 
   macos-arm64:
     name: macOS arm64 (IOSurface sink)
@@ -132,10 +151,7 @@ jobs:
           set -o pipefail
           cargo build -p livekit-ffi --release --target aarch64-apple-darwin 2>&1 | tee build.log
           rc=${PIPESTATUS[0]}
-          if [ $rc -ne 0 ]; then
-            echo "::error::cargo build 失败（exit $rc），下面是最后 40 行："
-            tail -n 40 build.log | while IFS= read -r line; do echo "::error::$line"; done
-          fi
+          if [ $rc -ne 0 ]; then echo "::error::cargo build 失败（exit $rc）"; fi
           exit $rc
 
       - name: Smoke test webrtc-sys
@@ -154,6 +170,28 @@ jobs:
           name: liblivekit_ffi-macos-arm64
           path: target/aarch64-apple-darwin/release/liblivekit_ffi.dylib
           if-no-files-found: warn
+
+      - name: Report failure
+        if: failure()
+        shell: bash
+        env:
+          GH_TOKEN: ${ secrets.GITHUB_TOKEN }
+          JOB_NAME: macOS arm64 (IOSurface sink)
+        run: |
+          {
+            echo "### $JOB_NAME 失败"
+            echo
+            echo "- LK_CUSTOM_WEBRTC=${LK_CUSTOM_WEBRTC}"
+            ls -l webrtc.zip 2>/dev/null || echo "(没有 webrtc.zip)"
+            echo
+            echo '```'
+            tail -n 60 build.log 2>/dev/null || echo "(没有 build.log)"
+            echo '```'
+          } > report.md
+          cat report.md
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/comments" \\
+            -f body="$(cat report.md)" >/dev/null 2>&1 || echo "（提交评论失败，忽略）"
+
 
   macos-x64:
     name: macOS x64 (IOSurface sink, 交叉编译)
@@ -191,11 +229,12 @@ jobs:
           set -o pipefail
           cargo build -p livekit-ffi --release --target x86_64-apple-darwin 2>&1 | tee build.log
           rc=${PIPESTATUS[0]}
-          if [ $rc -ne 0 ]; then
-            echo "::error::cargo build 失败（exit $rc），下面是最后 40 行："
-            tail -n 40 build.log | while IFS= read -r line; do echo "::error::$line"; done
-          fi
+          if [ $rc -ne 0 ]; then echo "::error::cargo build 失败（exit $rc）"; fi
           exit $rc
+
+      - name: Smoke test webrtc-sys
+        continue-on-error: true
+        run: cargo test -p webrtc-sys --release --target x86_64-apple-darwin -- --nocapture --test-threads=1 2>&1 | tail -n 60
 
       - name: Check artifact
         run: |
@@ -209,3 +248,25 @@ jobs:
           name: liblivekit_ffi-macos-x64
           path: target/x86_64-apple-darwin/release/liblivekit_ffi.dylib
           if-no-files-found: warn
+
+      - name: Report failure
+        if: failure()
+        shell: bash
+        env:
+          GH_TOKEN: ${ secrets.GITHUB_TOKEN }
+          JOB_NAME: macOS x64 (IOSurface sink, 交叉编译)
+        run: |
+          {
+            echo "### $JOB_NAME 失败"
+            echo
+            echo "- LK_CUSTOM_WEBRTC=${LK_CUSTOM_WEBRTC}"
+            ls -l webrtc.zip 2>/dev/null || echo "(没有 webrtc.zip)"
+            echo
+            echo '```'
+            tail -n 60 build.log 2>/dev/null || echo "(没有 build.log)"
+            echo '```'
+          } > report.md
+          cat report.md
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/comments" \\
+            -f body="$(cat report.md)" >/dev/null 2>&1 || echo "（提交评论失败，忽略）"
+
