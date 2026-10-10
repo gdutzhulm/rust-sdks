@@ -33,6 +33,7 @@ namespace livekit_ffi {
 class VideoTrack;
 class NativeVideoSink;
 class D3D11VideoSink;
+class IOSurfaceVideoSink;
 class VideoTrackSource;
 class PacketTrailerHandler;  // forward declaration to avoid circular include
 }  // namespace livekit_ffi
@@ -54,6 +55,11 @@ class VideoTrack : public MediaStreamTrack {
   void add_d3d11_sink(const std::shared_ptr<D3D11VideoSink>& sink) const;
   void remove_d3d11_sink(const std::shared_ptr<D3D11VideoSink>& sink) const;
 #endif
+#if defined(__APPLE__)
+  void add_iosurface_sink(const std::shared_ptr<IOSurfaceVideoSink>& sink) const;
+  void remove_iosurface_sink(
+      const std::shared_ptr<IOSurfaceVideoSink>& sink) const;
+#endif
   void remove_sink(const std::shared_ptr<NativeVideoSink>& sink) const;
 
   void set_should_receive(bool should_receive) const;
@@ -74,6 +80,9 @@ class VideoTrack : public MediaStreamTrack {
   mutable std::vector<std::shared_ptr<NativeVideoSink>> sinks_;
 #if defined(_WIN32)
   mutable std::vector<std::shared_ptr<D3D11VideoSink>> d3d11_sinks_;
+#endif
+#if defined(__APPLE__)
+  mutable std::vector<std::shared_ptr<IOSurfaceVideoSink>> iosurface_sinks_;
 #endif
 };
 

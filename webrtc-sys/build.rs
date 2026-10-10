@@ -62,6 +62,12 @@ fn main() {
         rust_files.push("src/d3d11_video_sink.rs");
     }
 
+    // macOS 侧的共享纹理 sink（IOSurface）：与 D3D11 版对等。IOSurface 框架已经在
+    // 下面的 macos 分支里链接过了（桌面采集要用），这里只多编一个文件 + 一个桥。
+    if target_os == "macos" {
+        rust_files.push("src/iosurface_video_sink.rs");
+    }
+
 
     if is_desktop {
         rust_files.push("src/desktop_capturer.rs");
@@ -105,6 +111,10 @@ fn main() {
 
     if target_os == "windows" {
         builder.file("src/d3d11_video_sink.cpp");
+    }
+
+    if target_os == "macos" {
+        builder.file("src/iosurface_video_sink.cpp");
     }
 
 

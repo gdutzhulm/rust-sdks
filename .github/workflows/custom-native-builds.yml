@@ -1,0 +1,136 @@
+# 定制原生库构建（Windows=D3D11 共享纹理 / macOS=IOSurface）
+#
+# 这个 workflow 只做一件事：在 CI 上把**我们定制过的** livekit_ffi 编出来，供本仓库
+# （MeettingCaptrue）的 SDK 使用：
+#   · windows-latest  → livekit_ffi.dll（D3D11 共享纹理 sink + 帧率上限 + 丢弃计数 + box 降采样）
+#   · macos-latest    → liblivekit_ffi.dylib（IOSurface sink，同样的限速/计数语义）
+#
+# webRTC 预编译**不需要手动准备**：webrtc-sys/build/src/lib.rs 会按 target 自动下载
+#   https://github.com/livekit/rust-sdks/releases/download/webrtc-51ef663/webrtc-<os>-<arch>-release.zip
+# 所以 runner 上只要 Rust + protoc 就够（Xcode / MSVC 都是 runner 自带的）。
+#
+# 用法：改完 webrtc-sys / libwebrtc / livekit-ffi 推上来即自动跑；也可以手动 Run workflow。
+# 产物在本次 run 的 Artifacts 里下载，然后：
+#   livekit_ffi.dll      → LiveKit.Client.Sdk/runtimes/win-x64/native/
+#   liblivekit_ffi.dylib → LiveKit.Client.Sdk/runtimes/{osx-arm64|osx-x64}/native/
+
+name: Custom native builds (D3D11 + IOSurface)
+
+on:
+  push:
+    branches: [custom/d3d11-video-sink]
+    paths:
+      - 'webrtc-sys/**'
+      - 'libwebrtc/**'
+      - 'livekit-ffi/**'
+      - '.github/workflows/custom-native-builds.yml'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  PROFILE: release
+
+jobs:
+  windows-x64:
+    name: Windows x64 (D3D11 sink)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: x86_64-pc-windows-msvc
+          cache: true
+      - uses: arduino/setup-protoc@v3
+        with:
+          version: '25.2'
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build livekit-ffi (${{ env.PROFILE }})
+        run: cargo build -p livekit-ffi --release --target x86_64-pc-windows-msvc
+
+      # 冒烟测试（D3D11 sink）：建共享纹理、上下翻转、帧号、限速丢帧、丢弃计数。
+      # 失败不阻塞产物上传，但会在日志里标记出来（CI 里没有真实摄像头/对端，只跑协议级用例）。
+      - name: Smoke test webrtc-sys
+        continue-on-error: true
+        run: cargo test -p webrtc-sys --release --target x86_64-pc-windows-msvc -- --nocapture --test-threads=1
+
+      - name: Check artifact
+        shell: pwsh
+        run: |
+          $p = 'target/x86_64-pc-windows-msvc/release/livekit_ffi.dll'
+          if (-not (Test-Path $p)) { throw "缺少产物：$p" }
+          Get-Item $p | Select-Object FullName, Length, LastWriteTime
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: livekit_ffi-windows-x64
+          path: target/x86_64-pc-windows-msvc/release/livekit_ffi.dll
+          if-no-files-found: error
+
+  macos-arm64:
+    name: macOS arm64 (IOSurface sink)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: aarch64-apple-darwin
+          cache: true
+      - uses: arduino/setup-protoc@v3
+        with:
+          version: '25.2'
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build livekit-ffi (${{ env.PROFILE }})
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '11.0'   # aarch64 最低 11
+        run: cargo build -p livekit-ffi --release --target aarch64-apple-darwin
+
+      # IOSurface sink 的冒烟测试：建 surface、自上而下写、帧号、限速丢帧、丢弃计数。
+      # 注意：老版 mac / 某些虚拟机里 IOSurfaceCreate 可能不可用 —— 失败不阻塞产物。
+      - name: Smoke test webrtc-sys
+        continue-on-error: true
+        run: cargo test -p webrtc-sys --release --target aarch64-apple-darwin -- --nocapture --test-threads=1
+
+      - name: Check artifact
+        run: |
+          f=target/aarch64-apple-darwin/release/liblivekit_ffi.dylib
+          test -f "$f" || { echo "缺少产物：$f"; exit 1; }
+          ls -l "$f"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: liblivekit_ffi-macos-arm64
+          path: target/aarch64-apple-darwin/release/liblivekit_ffi.dylib
+          if-no-files-found: error
+
+  macos-x64:
+    name: macOS x64 (IOSurface sink, 交叉编译)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: x86_64-apple-darwin
+          cache: true
+      - uses: arduino/setup-protoc@v3
+        with:
+          version: '25.2'
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build livekit-ffi (${{ env.PROFILE }})
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '10.15'
+        run: cargo build -p livekit-ffi --release --target x86_64-apple-darwin
+
+      - name: Check artifact
+        run: |
+          f=target/x86_64-apple-darwin/release/liblivekit_ffi.dylib
+          test -f "$f" || { echo "缺少产物：$f"; exit 1; }
+          ls -l "$f"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: liblivekit_ffi-macos-x64
+          path: target/x86_64-apple-darwin/release/liblivekit_ffi.dylib
+          if-no-files-found: error

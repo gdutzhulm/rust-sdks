@@ -186,6 +186,10 @@ enum VideoStreamType {
   VIDEO_STREAM_WEBGL = 1;
   VIDEO_STREAM_HTML = 2;
   VIDEO_STREAM_D3D11_TEXTURE = 3;
+  // macOS：原生把帧写成 BGRA 的 IOSurface，托管侧按 `IOSurfaceRef` 导入 Metal 合成。
+  // 语义与 VIDEO_STREAM_D3D11_TEXTURE 完全一致（同样支持 texture_width/height 与 max_fps），
+  // 只是句柄的含义换成 IOSurfaceRef（同进程内有效）。
+  VIDEO_STREAM_IOSURFACE_TEXTURE = 4;
 }
 
 message VideoStreamInfo {

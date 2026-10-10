@@ -21,6 +21,8 @@ use livekit::{
     },
 };
 
+#[cfg(target_os = "macos")]
+use livekit::webrtc::video_stream::iosurface::IOSurfaceVideoStream;
 #[cfg(target_os = "windows")]
 use livekit::webrtc::video_stream::d3d11::D3D11VideoStream;
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -36,6 +38,9 @@ pub struct FfiVideoStream {
 
     #[cfg(target_os = "windows")]
     d3d11_stream: Option<D3D11VideoStream>,
+
+    #[cfg(target_os = "macos")]
+    iosurface_stream: Option<IOSurfaceVideoStream>,
 
     #[allow(dead_code)]
     self_dropped_tx: oneshot::Sender<()>, // Close the stream on drop
@@ -77,7 +82,7 @@ impl FfiVideoStream {
         let stream = match stream_type {
             #[cfg(not(target_arch = "wasm32"))]
             proto::VideoStreamType::VideoStreamNative => {
-                let video_stream = Self { handle_id, self_dropped_tx, stream_type, #[cfg(target_os = "windows")] d3d11_stream: None };
+                let video_stream = Self { handle_id, self_dropped_tx, stream_type, #[cfg(target_os = "windows")] d3d11_stream: None, #[cfg(target_os = "macos")] iosurface_stream: None };
                 let options = NativeVideoStreamOptions {
                     queue_size_frames: new_stream
                         .queue_size_frames
@@ -122,6 +127,32 @@ impl FfiVideoStream {
                     d3d11_stream: Some(d3d11_stream),
                 })
             }
+            #[cfg(target_os = "macos")]
+            proto::VideoStreamType::VideoStreamIosurfaceTexture => {
+                let texture_width = new_stream.texture_width.unwrap_or(1920).max(2);
+                let texture_height = new_stream.texture_height.unwrap_or(1080).max(2);
+                // 本端（观看侧）写 surface 的帧率上限，语义与 Windows 侧一致：0 = 不限。
+                let max_fps = new_stream.max_fps.unwrap_or(0);
+                let iosurface_stream =
+                    IOSurfaceVideoStream::new(rtc_track, texture_width, texture_height, max_fps);
+                if !iosurface_stream.valid() {
+                    return Err(FfiError::InvalidRequest(
+                        "failed to create IOSurface video sink".into(),
+                    ));
+                }
+                log::info!(
+                    "IOSurface video stream: {}x{}, max_fps={} (0 = unlimited)",
+                    texture_width,
+                    texture_height,
+                    max_fps
+                );
+                Ok::<FfiVideoStream, FfiError>(Self {
+                    handle_id,
+                    self_dropped_tx,
+                    stream_type,
+                    iosurface_stream: Some(iosurface_stream),
+                })
+            }
             _ => return Err(FfiError::InvalidRequest("unsupported video stream type".into())),
         }?;
 
@@ -143,7 +174,7 @@ impl FfiVideoStream {
         let stream = match stream_type {
             #[cfg(not(target_arch = "wasm32"))]
             proto::VideoStreamType::VideoStreamNative => {
-                let video_stream = Self { handle_id, self_dropped_tx, stream_type, #[cfg(target_os = "windows")] d3d11_stream: None };
+                let video_stream = Self { handle_id, self_dropped_tx, stream_type, #[cfg(target_os = "windows")] d3d11_stream: None, #[cfg(target_os = "macos")] iosurface_stream: None };
                 let handle = server.async_runtime.spawn(Self::participant_video_stream_task(
                     server,
                     request,
@@ -166,6 +197,15 @@ impl FfiVideoStream {
         #[cfg(target_os = "windows")]
         if let Some(stream) = &self.d3d11_stream {
             return (Some(stream.shared_handle()), Some(stream.width()), Some(stream.height()));
+        }
+
+        #[cfg(target_os = "macos")]
+        if let Some(stream) = &self.iosurface_stream {
+            return (
+                Some(stream.surface_handle()),
+                Some(stream.width()),
+                Some(stream.height()),
+            );
         }
 
         (None, None, None)

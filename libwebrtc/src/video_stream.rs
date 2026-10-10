@@ -73,6 +73,67 @@ pub mod d3d11 {
 }
 
 
+#[cfg(target_os = "macos")]
+pub mod iosurface {
+    use cxx::SharedPtr;
+    use webrtc_sys::iosurface_video_sink as sys_ios;
+
+    use crate::video_track::RtcVideoTrack;
+    use webrtc_sys::video_track as sys_vt;
+
+    /// macOS 上的"视频流（共享纹理）"路径：原生把解码/采集帧写成 BGRA 的 **IOSurface**，
+    /// Avalonia 的 Metal 合成器按 `IOSurfaceRef` 直接导入合成。
+    /// 与 Windows 上的 `d3d11::D3D11VideoStream` 一一对应。
+    pub struct IOSurfaceVideoStream {
+        sink: SharedPtr<sys_ios::ffi::IOSurfaceVideoSink>,
+        video_track: RtcVideoTrack,
+    }
+
+    impl IOSurfaceVideoStream {
+        pub fn new(
+            video_track: RtcVideoTrack,
+            width: u32,
+            height: u32,
+            max_fps: u32,
+        ) -> Self {
+            let sink = sys_ios::ffi::new_iosurface_video_sink(width, height, max_fps);
+            let video = unsafe { sys_vt::ffi::media_to_video(video_track.sys_handle()) };
+            video.add_iosurface_sink(&sink);
+            Self { sink, video_track }
+        }
+
+        /// 传给 C# 的句柄：IOSurfaceRef 指针（同进程内有效）。
+        pub fn surface_handle(&self) -> u64 {
+            self.sink.surface_handle()
+        }
+
+        pub fn width(&self) -> u32 {
+            self.sink.width()
+        }
+
+        pub fn height(&self) -> u32 {
+            self.sink.height()
+        }
+
+        pub fn max_fps(&self) -> u32 {
+            self.sink.max_fps()
+        }
+
+        pub fn valid(&self) -> bool {
+            self.sink.valid()
+        }
+    }
+
+    impl Drop for IOSurfaceVideoStream {
+        fn drop(&mut self) {
+            self.sink.set_producer_active(false);
+            let video = unsafe { sys_vt::ffi::media_to_video(self.video_track.sys_handle()) };
+            video.remove_iosurface_sink(&self.sink);
+            sys_ios::ffi::retire_iosurface_video_sink(&self.sink);
+        }
+    }
+}
+
 // There is no shared sink between native and web platforms.
 // Each platform requires different configuration (e.g: WebGlContext, ..)
 

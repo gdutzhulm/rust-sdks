@@ -27,6 +27,7 @@
 #include "audio/remix_resample.h"
 #include "common_audio/include/audio_util.h"
 #include "livekit/d3d11_video_sink.h"
+#include "livekit/iosurface_video_sink.h"
 #include "livekit/dmabuf_video_frame_buffer.h"
 #include "livekit/media_stream.h"
 #include "livekit/packet_trailer.h"
@@ -72,6 +73,25 @@ void VideoTrack::remove_sink(
 }
 
 #if defined(_WIN32)
+#if defined(__APPLE__)
+void VideoTrack::add_iosurface_sink(
+    const std::shared_ptr<IOSurfaceVideoSink>& sink) const {
+  webrtc::MutexLock lock(&mutex_);
+  track()->AddOrUpdateSink(sink.get(), webrtc::VideoSinkWants());
+  iosurface_sinks_.push_back(sink);
+}
+
+void VideoTrack::remove_iosurface_sink(
+    const std::shared_ptr<IOSurfaceVideoSink>& sink) const {
+  webrtc::MutexLock lock(&mutex_);
+  track()->RemoveSink(sink.get());
+  iosurface_sinks_.erase(
+      std::remove(iosurface_sinks_.begin(), iosurface_sinks_.end(), sink),
+      iosurface_sinks_.end());
+}
+#endif
+
+#if defined(_WIN32)
 void VideoTrack::add_d3d11_sink(
     const std::shared_ptr<D3D11VideoSink>& sink) const {
   webrtc::MutexLock lock(&mutex_);
@@ -87,6 +107,7 @@ void VideoTrack::remove_d3d11_sink(
       std::remove(d3d11_sinks_.begin(), d3d11_sinks_.end(), sink),
       d3d11_sinks_.end());
 }
+#endif
 #endif
 
 void VideoTrack::set_should_receive(bool should_receive) const {

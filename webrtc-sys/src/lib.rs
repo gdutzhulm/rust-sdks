@@ -21,6 +21,12 @@ pub mod audio_resampler;
 pub mod audio_track;
 pub mod candidate;
 pub mod data_channel;
+// **定制新增**：共享纹理 sink 的 Rust 桥。
+// 注意：这两个声明以前漏在提交之外（只在编译树里），所以定制仓库单独 checkout 是**构建不过**的。
+#[cfg(target_os = "windows")]
+pub mod d3d11_video_sink;
+#[cfg(target_os = "macos")]
+pub mod iosurface_video_sink;
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 pub mod desktop_capturer;
 pub mod frame_cryptor;
