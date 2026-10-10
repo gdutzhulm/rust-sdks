@@ -72,7 +72,6 @@ void VideoTrack::remove_sink(
   sinks_.erase(std::remove(sinks_.begin(), sinks_.end(), sink), sinks_.end());
 }
 
-#if defined(_WIN32)
 #if defined(__APPLE__)
 void VideoTrack::add_iosurface_sink(
     const std::shared_ptr<IOSurfaceVideoSink>& sink) const {
@@ -107,7 +106,6 @@ void VideoTrack::remove_d3d11_sink(
       std::remove(d3d11_sinks_.begin(), d3d11_sinks_.end(), sink),
       d3d11_sinks_.end());
 }
-#endif
 #endif
 
 void VideoTrack::set_should_receive(bool should_receive) const {
