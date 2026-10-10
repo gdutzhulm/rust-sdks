@@ -37,6 +37,10 @@ message NewVideoStreamRequest {
   // unbounded buffering, for only one of them can increase end-to-end latency
   // for that stream and cause audio/video drift.
   optional uint32 queue_size_frames = 5;
+  // Optional D3D11 texture size for the GPU texture stream. 0 means
+  // the native side may choose a default.
+  optional uint32 texture_width = 6;
+  optional uint32 texture_height = 7;
 }
 message NewVideoStreamResponse { required OwnedVideoStream stream = 1; }
 
@@ -168,9 +172,13 @@ enum VideoStreamType {
   VIDEO_STREAM_NATIVE = 0;
   VIDEO_STREAM_WEBGL = 1;
   VIDEO_STREAM_HTML = 2;
+  VIDEO_STREAM_D3D11_TEXTURE = 3;
 }
 
 message VideoStreamInfo {
+  optional uint64 shared_texture_handle = 2;
+  optional uint32 texture_width = 3;
+  optional uint32 texture_height = 4;
   required VideoStreamType type = 1;
 }
 

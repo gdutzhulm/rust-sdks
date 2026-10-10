@@ -58,6 +58,11 @@ fn main() {
         "src/packet_trailer.rs",
     ];
 
+    if target_os == "windows" {
+        rust_files.push("src/d3d11_video_sink.rs");
+    }
+
+
     if is_desktop {
         rust_files.push("src/desktop_capturer.rs");
     }
@@ -97,6 +102,11 @@ fn main() {
         "src/packet_trailer.cpp",
         "src/packet_trailer_av1.cpp",
     ]);
+
+    if target_os == "windows" {
+        builder.file("src/d3d11_video_sink.cpp");
+    }
+
 
     if is_desktop {
         builder.file("src/desktop_capturer.cpp");

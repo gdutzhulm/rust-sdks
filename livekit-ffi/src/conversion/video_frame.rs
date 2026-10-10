@@ -36,7 +36,13 @@ impl From<&FfiVideoSource> for proto::VideoSourceInfo {
 
 impl From<&FfiVideoStream> for proto::VideoStreamInfo {
     fn from(stream: &FfiVideoStream) -> Self {
-        Self { r#type: stream.stream_type as i32 }
+        let (shared_texture_handle, texture_width, texture_height) = stream.gpu_texture_info();
+        Self {
+            r#type: stream.stream_type as i32,
+            shared_texture_handle,
+            texture_width,
+            texture_height,
+        }
     }
 }
 

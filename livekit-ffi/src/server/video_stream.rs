@@ -20,6 +20,9 @@ use livekit::{
         video_stream::native::{NativeVideoStream, NativeVideoStreamOptions},
     },
 };
+
+#[cfg(target_os = "windows")]
+use livekit::webrtc::video_stream::d3d11::D3D11VideoStream;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use super::{colorcvt, room::FfiTrack, FfiHandle};
@@ -30,6 +33,9 @@ use livekit::webrtc::video_frame::FrameMetadata;
 pub struct FfiVideoStream {
     pub handle_id: FfiHandleId,
     pub stream_type: proto::VideoStreamType,
+
+    #[cfg(target_os = "windows")]
+    d3d11_stream: Option<D3D11VideoStream>,
 
     #[allow(dead_code)]
     self_dropped_tx: oneshot::Sender<()>, // Close the stream on drop
@@ -71,7 +77,7 @@ impl FfiVideoStream {
         let stream = match stream_type {
             #[cfg(not(target_arch = "wasm32"))]
             proto::VideoStreamType::VideoStreamNative => {
-                let video_stream = Self { handle_id, self_dropped_tx, stream_type };
+                let video_stream = Self { handle_id, self_dropped_tx, stream_type, #[cfg(target_os = "windows")] d3d11_stream: None };
                 let options = NativeVideoStreamOptions {
                     queue_size_frames: new_stream
                         .queue_size_frames
@@ -89,6 +95,21 @@ impl FfiVideoStream {
                 ));
                 server.watch_panic(handle);
                 Ok::<FfiVideoStream, FfiError>(video_stream)
+            }
+            #[cfg(target_os = "windows")]
+            proto::VideoStreamType::VideoStreamD3d11Texture => {
+                let texture_width = new_stream.texture_width.unwrap_or(1920).max(2);
+                let texture_height = new_stream.texture_height.unwrap_or(1080).max(2);
+                let d3d11_stream = D3D11VideoStream::new(rtc_track, texture_width, texture_height);
+                if !d3d11_stream.valid() {
+                    return Err(FfiError::InvalidRequest("failed to create D3D11 video sink".into()));
+                }
+                Ok::<FfiVideoStream, FfiError>(Self {
+                    handle_id,
+                    self_dropped_tx,
+                    stream_type,
+                    d3d11_stream: Some(d3d11_stream),
+                })
             }
             _ => return Err(FfiError::InvalidRequest("unsupported video stream type".into())),
         }?;
@@ -111,7 +132,7 @@ impl FfiVideoStream {
         let stream = match stream_type {
             #[cfg(not(target_arch = "wasm32"))]
             proto::VideoStreamType::VideoStreamNative => {
-                let video_stream = Self { handle_id, self_dropped_tx, stream_type };
+                let video_stream = Self { handle_id, self_dropped_tx, stream_type, #[cfg(target_os = "windows")] d3d11_stream: None };
                 let handle = server.async_runtime.spawn(Self::participant_video_stream_task(
                     server,
                     request,
@@ -129,6 +150,16 @@ impl FfiVideoStream {
 
         Ok(proto::OwnedVideoStream { handle: proto::FfiOwnedHandle { id: handle_id }, info: info })
     }
+
+    pub fn gpu_texture_info(&self) -> (Option<u64>, Option<u32>, Option<u32>) {
+        #[cfg(target_os = "windows")]
+        if let Some(stream) = &self.d3d11_stream {
+            return (Some(stream.shared_handle()), Some(stream.width()), Some(stream.height()));
+        }
+
+        (None, None, None)
+    }
+
 
     async fn native_video_stream_task(
         server: &'static server::FfiServer,

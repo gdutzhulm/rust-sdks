@@ -32,6 +32,7 @@
 namespace livekit_ffi {
 class VideoTrack;
 class NativeVideoSink;
+class D3D11VideoSink;
 class VideoTrackSource;
 class PacketTrailerHandler;  // forward declaration to avoid circular include
 }  // namespace livekit_ffi
@@ -49,6 +50,10 @@ class VideoTrack : public MediaStreamTrack {
   ~VideoTrack();
 
   void add_sink(const std::shared_ptr<NativeVideoSink>& sink) const;
+#if defined(_WIN32)
+  void add_d3d11_sink(const std::shared_ptr<D3D11VideoSink>& sink) const;
+  void remove_d3d11_sink(const std::shared_ptr<D3D11VideoSink>& sink) const;
+#endif
   void remove_sink(const std::shared_ptr<NativeVideoSink>& sink) const;
 
   void set_should_receive(bool should_receive) const;
@@ -67,6 +72,9 @@ class VideoTrack : public MediaStreamTrack {
   // Keep a strong reference to the added sinks, so we don't need to
   // manage the lifetime safety on the Rust side
   mutable std::vector<std::shared_ptr<NativeVideoSink>> sinks_;
+#if defined(_WIN32)
+  mutable std::vector<std::shared_ptr<D3D11VideoSink>> d3d11_sinks_;
+#endif
 };
 
 class NativeVideoSink : public webrtc::VideoSinkInterface<webrtc::VideoFrame> {

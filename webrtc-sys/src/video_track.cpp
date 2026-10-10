@@ -26,6 +26,7 @@
 #include "api/video/video_rotation.h"
 #include "audio/remix_resample.h"
 #include "common_audio/include/audio_util.h"
+#include "livekit/d3d11_video_sink.h"
 #include "livekit/dmabuf_video_frame_buffer.h"
 #include "livekit/media_stream.h"
 #include "livekit/packet_trailer.h"
@@ -48,6 +49,11 @@ VideoTrack::~VideoTrack() {
   for (auto& sink : sinks_) {
     track()->RemoveSink(sink.get());
   }
+#if defined(_WIN32)
+  for (auto& sink : d3d11_sinks_) {
+    track()->RemoveSink(sink.get());
+  }
+#endif
 }
 
 void VideoTrack::add_sink(const std::shared_ptr<NativeVideoSink>& sink) const {
@@ -64,6 +70,24 @@ void VideoTrack::remove_sink(
   track()->RemoveSink(sink.get());
   sinks_.erase(std::remove(sinks_.begin(), sinks_.end(), sink), sinks_.end());
 }
+
+#if defined(_WIN32)
+void VideoTrack::add_d3d11_sink(
+    const std::shared_ptr<D3D11VideoSink>& sink) const {
+  webrtc::MutexLock lock(&mutex_);
+  track()->AddOrUpdateSink(sink.get(), webrtc::VideoSinkWants());
+  d3d11_sinks_.push_back(sink);
+}
+
+void VideoTrack::remove_d3d11_sink(
+    const std::shared_ptr<D3D11VideoSink>& sink) const {
+  webrtc::MutexLock lock(&mutex_);
+  track()->RemoveSink(sink.get());
+  d3d11_sinks_.erase(
+      std::remove(d3d11_sinks_.begin(), d3d11_sinks_.end(), sink),
+      d3d11_sinks_.end());
+}
+#endif
 
 void VideoTrack::set_should_receive(bool should_receive) const {
   track()->set_should_receive(should_receive);

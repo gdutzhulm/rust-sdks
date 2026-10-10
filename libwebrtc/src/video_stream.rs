@@ -14,6 +14,56 @@
 
 use crate::imp::video_stream as stream_imp;
 
+#[cfg(target_os = "windows")]
+pub mod d3d11 {
+    use cxx::SharedPtr;
+    use webrtc_sys::d3d11_video_sink as sys_d3d11;
+
+    use crate::video_track::RtcVideoTrack;
+    use webrtc_sys::video_track as sys_vt;
+
+    /// Receives decoded frames directly into a D3D11 shared texture.
+    pub struct D3D11VideoStream {
+        sink: SharedPtr<sys_d3d11::ffi::D3D11VideoSink>,
+        video_track: RtcVideoTrack,
+    }
+
+    impl D3D11VideoStream {
+        pub fn new(video_track: RtcVideoTrack, width: u32, height: u32) -> Self {
+            let sink = sys_d3d11::ffi::new_d3d11_video_sink(width, height);
+            let video = unsafe { sys_vt::ffi::media_to_video(video_track.sys_handle()) };
+            video.add_d3d11_sink(&sink);
+            Self { sink, video_track }
+        }
+
+        pub fn shared_handle(&self) -> u64 {
+            self.sink.shared_handle()
+        }
+
+        pub fn width(&self) -> u32 {
+            self.sink.width()
+        }
+
+        pub fn height(&self) -> u32 {
+            self.sink.height()
+        }
+
+        pub fn valid(&self) -> bool {
+            self.sink.valid()
+        }
+    }
+
+    impl Drop for D3D11VideoStream {
+        fn drop(&mut self) {
+            self.sink.set_producer_active(false);
+            let video = unsafe { sys_vt::ffi::media_to_video(self.video_track.sys_handle()) };
+            video.remove_d3d11_sink(&self.sink);
+            sys_d3d11::ffi::retire_d3d11_video_sink(&self.sink);
+        }
+    }
+}
+
+
 // There is no shared sink between native and web platforms.
 // Each platform requires different configuration (e.g: WebGlContext, ..)
 
