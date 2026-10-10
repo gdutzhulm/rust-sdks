@@ -111,8 +111,14 @@ jobs:
             echo '```'
           } > report.md
           cat report.md
-          gh api -X POST "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/comments" \\
-            -f body="$(cat report.md)" >/dev/null 2>&1 || echo "（提交评论失败，忽略）"
+          # gh 的 -F key=@file 才会把文件内容原样发送；这里刻意不写行尾续行符
+          # （YAML 块标量里的反斜杠会被当字面字符，GitHub 上实测会让这一步犯错）。
+          if gh api -X POST "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/comments" -F body=@report.md >/dev/null 2>&1; then
+            echo "已把日志尾巴发到 commit 评论"
+          else
+            echo "（提交评论失败，忽略）"
+          fi
+          true
 
 
   macos-arm64:
@@ -189,8 +195,14 @@ jobs:
             echo '```'
           } > report.md
           cat report.md
-          gh api -X POST "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/comments" \\
-            -f body="$(cat report.md)" >/dev/null 2>&1 || echo "（提交评论失败，忽略）"
+          # gh 的 -F key=@file 才会把文件内容原样发送；这里刻意不写行尾续行符
+          # （YAML 块标量里的反斜杠会被当字面字符，GitHub 上实测会让这一步犯错）。
+          if gh api -X POST "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/comments" -F body=@report.md >/dev/null 2>&1; then
+            echo "已把日志尾巴发到 commit 评论"
+          else
+            echo "（提交评论失败，忽略）"
+          fi
+          true
 
 
   macos-x64:
@@ -267,6 +279,12 @@ jobs:
             echo '```'
           } > report.md
           cat report.md
-          gh api -X POST "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/comments" \\
-            -f body="$(cat report.md)" >/dev/null 2>&1 || echo "（提交评论失败，忽略）"
+          # gh 的 -F key=@file 才会把文件内容原样发送；这里刻意不写行尾续行符
+          # （YAML 块标量里的反斜杠会被当字面字符，GitHub 上实测会让这一步犯错）。
+          if gh api -X POST "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/comments" -F body=@report.md >/dev/null 2>&1; then
+            echo "已把日志尾巴发到 commit 评论"
+          else
+            echo "（提交评论失败，忽略）"
+          fi
+          true
 
