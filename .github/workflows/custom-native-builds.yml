@@ -9,6 +9,8 @@
 #   https://github.com/livekit/rust-sdks/releases/download/webrtc-51ef663/webrtc-<triple>.zip
 #
 # 失败时会把 build.log 的尾巴写成 commit 评论（"Report failure" 步骤），方便直接定位。
+# 注意：这一步需要仓库 Settings → Actions → General → Workflow permissions 为 "Read and write"，
+# 否则 GITHUB_TOKEN 是只读的，评论发不出去（只影响这步，不影响构建与产物）。
 #
 # 产物在本次 run 的 Artifacts 里：
 #   livekit_ffi.dll      → LiveKit.Client.Sdk/runtimes/win-x64/native/
