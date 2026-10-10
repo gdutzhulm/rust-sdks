@@ -38,7 +38,12 @@ jobs:
     name: Windows x64 (D3D11 sink)
     runs-on: windows-latest
     steps:
+      # **必须检出 submodule**：yuv-sys/build.rs 的 clone_if_needed() 其实是把仓库里的
+      # `yuv-sys/libyuv`（submodule）拷进 OUT_DIR；不检出就是空目录 →
+      # `fs::read_dir(include/libyuv)` 直接 NotFound（CI 实测：build.rs:140 panic，exit 101）。
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           target: x86_64-pc-windows-msvc
@@ -125,7 +130,12 @@ jobs:
     name: macOS arm64 (IOSurface sink)
     runs-on: macos-latest
     steps:
+      # **必须检出 submodule**：yuv-sys/build.rs 的 clone_if_needed() 其实是把仓库里的
+      # `yuv-sys/libyuv`（submodule）拷进 OUT_DIR；不检出就是空目录 →
+      # `fs::read_dir(include/libyuv)` 直接 NotFound（CI 实测：build.rs:140 panic，exit 101）。
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           target: aarch64-apple-darwin
@@ -209,7 +219,12 @@ jobs:
     name: macOS x64 (IOSurface sink, 交叉编译)
     runs-on: macos-latest
     steps:
+      # **必须检出 submodule**：yuv-sys/build.rs 的 clone_if_needed() 其实是把仓库里的
+      # `yuv-sys/libyuv`（submodule）拷进 OUT_DIR；不检出就是空目录 →
+      # `fs::read_dir(include/libyuv)` 直接 NotFound（CI 实测：build.rs:140 panic，exit 101）。
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           target: x86_64-apple-darwin
