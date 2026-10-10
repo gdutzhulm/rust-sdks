@@ -72,6 +72,11 @@ jobs:
           Write-Host "LK_CUSTOM_WEBRTC=$($ninja.DirectoryName)"
           Get-ChildItem $ninja.DirectoryName | Select-Object Name, Length
 
+      # 让 clang/C++ 的编译错误变成 GitHub 注解（默认只有 rustc 的会被标出来），
+      # 这样失败时能在 check-run 注解里直接看到"哪个文件哪一行错什么"，不用翻日志。
+      - name: Register clang problem matcher
+        run: echo "::add-matcher::.github/matchers/clang.json"
+
       - name: Build livekit-ffi (release)
         shell: bash
         run: |
@@ -162,6 +167,11 @@ jobs:
           echo "LK_CUSTOM_WEBRTC=$PWD/$root"
           ls -l "$root"
 
+      # 让 clang/C++ 的编译错误变成 GitHub 注解（默认只有 rustc 的会被标出来），
+      # 这样失败时能在 check-run 注解里直接看到"哪个文件哪一行错什么"，不用翻日志。
+      - name: Register clang problem matcher
+        run: echo "::add-matcher::.github/matchers/clang.json"
+
       - name: Build livekit-ffi (release)
         env:
           MACOSX_DEPLOYMENT_TARGET: '11.0'
@@ -250,6 +260,11 @@ jobs:
           echo "LK_CUSTOM_WEBRTC=$PWD/$root" >> $GITHUB_ENV
           echo "LK_CUSTOM_WEBRTC=$PWD/$root"
           ls -l "$root"
+
+      # 让 clang/C++ 的编译错误变成 GitHub 注解（默认只有 rustc 的会被标出来），
+      # 这样失败时能在 check-run 注解里直接看到"哪个文件哪一行错什么"，不用翻日志。
+      - name: Register clang problem matcher
+        run: echo "::add-matcher::.github/matchers/clang.json"
 
       - name: Build livekit-ffi (release)
         env:
