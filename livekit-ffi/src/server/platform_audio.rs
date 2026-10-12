@@ -110,9 +110,19 @@ pub fn on_set_recording_device(
 ) -> FfiResult<proto::SetRecordingDeviceResponse> {
     let ffi_audio = server.retrieve_handle::<FfiPlatformAudio>(req.platform_audio_handle)?;
 
+    // 【本地定制 fork】原实现走 set_recording_device，它刻意**不做** stop/init/start（只记设备号），
+    // 于是"会议中切麦克风"不会立刻生效 —— 原生为这种场景另有一个 switch_recording_device。
+    // 这里改走 switch_recording_device：正在采集时做 stop → set → init → start；没在采集时两者等价。
+    // 请求名仍是 SetRecordingDevice（不动 proto，也不动 C# 侧）。
     let device_id = RecordingDeviceId::from_unchecked_guid(&req.device_id);
-    match ffi_audio.audio.set_recording_device(&device_id) {
-        Ok(()) => Ok(proto::SetRecordingDeviceResponse { error: None }),
+    match ffi_audio.audio.switch_recording_device(&device_id) {
+        Ok(()) => {
+            log::info!(
+                "[PLATFORM_AUDIO_FFI] recording device switched (hot-swap): guid={}",
+                req.device_id
+            );
+            Ok(proto::SetRecordingDeviceResponse { error: None })
+        }
         Err(e) => Ok(proto::SetRecordingDeviceResponse { error: Some(e.to_string()) }),
     }
 }
@@ -123,9 +133,18 @@ pub fn on_set_playout_device(
 ) -> FfiResult<proto::SetPlayoutDeviceResponse> {
     let ffi_audio = server.retrieve_handle::<FfiPlatformAudio>(req.platform_audio_handle)?;
 
+    // 【本地定制 fork】同上：set_playout_device 明确不 init/start（Rust 侧注释写着它只用于"启动前选设备"），
+    // 运行期热切换要用 switch_playout_device（stop → set → init → start）。这里改走后者：
+    // 放音没在跑时等价于只记设备号；正在放音时立刻把声音切到新设备（不用重进会议）。
     let device_id = PlayoutDeviceId::from_unchecked_guid(&req.device_id);
-    match ffi_audio.audio.set_playout_device(&device_id) {
-        Ok(()) => Ok(proto::SetPlayoutDeviceResponse { error: None }),
+    match ffi_audio.audio.switch_playout_device(&device_id) {
+        Ok(()) => {
+            log::info!(
+                "[PLATFORM_AUDIO_FFI] playout device switched (hot-swap): guid={}",
+                req.device_id
+            );
+            Ok(proto::SetPlayoutDeviceResponse { error: None })
+        }
         Err(e) => Ok(proto::SetPlayoutDeviceResponse { error: Some(e.to_string()) }),
     }
 }
