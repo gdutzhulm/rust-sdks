@@ -1104,6 +1104,8 @@ impl PlatformAudio {
         // When prefer_hardware_processing is false, we disable hardware effects
         // to force WebRTC to use its software APM instead
         let use_hardware = options.prefer_hardware_processing;
+        // 【本地定制 fork】记录"请求了硬件、但开关失败"的情况：下面会整体回退到软件再配一次。
+        let mut hardware_enable_failed = false;
 
         // Enable/disable hardware AEC
         // Note: When hardware is disabled, WebRTC automatically falls back to software
@@ -1111,6 +1113,9 @@ impl PlatformAudio {
             let enable_hw = use_hardware && options.echo_cancellation;
             if !runtime.enable_builtin_aec(enable_hw) {
                 log::warn!("enable_builtin_aec({}) failed", enable_hw);
+                if enable_hw {
+                    hardware_enable_failed = true;
+                }
             }
         }
 
@@ -1119,6 +1124,9 @@ impl PlatformAudio {
             let enable_hw = use_hardware && options.auto_gain_control;
             if !runtime.enable_builtin_agc(enable_hw) {
                 log::warn!("enable_builtin_agc({}) failed", enable_hw);
+                if enable_hw {
+                    hardware_enable_failed = true;
+                }
             }
         }
 
@@ -1127,8 +1135,25 @@ impl PlatformAudio {
             let enable_hw = use_hardware && options.noise_suppression;
             if !runtime.enable_builtin_ns(enable_hw) {
                 log::warn!("enable_builtin_ns({}) failed", enable_hw);
+                if enable_hw {
+                    hardware_enable_failed = true;
+                }
             }
         }
+
+        if hardware_enable_failed {
+            // 【本地定制 fork】请求了硬件却开不起来（典型：驱动**声明**有 AEC APO，但只允许在音频流
+            // 未启动时开关它）—— 这时不能停在"半开"状态，明确整体回退到软件 AEC3/NS/AGC 再配一次。
+            log::warn!(
+                "platform audio: hardware processing unavailable (prefer_hw=true failed); \
+falling back to software AEC3/NS/AGC"
+            );
+            return self.configure_audio_processing(AudioProcessingOptions {
+                prefer_hardware_processing: false,
+                ..options
+            });
+        }
+
 
         log::info!(
             "Audio processing configured: AEC={}, AGC={}, NS={}, prefer_hw={}",

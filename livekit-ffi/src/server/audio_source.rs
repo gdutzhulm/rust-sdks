@@ -59,11 +59,30 @@ impl FfiAudioSource {
                     if let Ok(ffi_audio) =
                         server.retrieve_handle::<super::platform_audio::FfiPlatformAudio>(handle)
                     {
+                        // 【本地定制 fork】引擎侧音频处理参数：
+                        //   · prefer_hardware 未显式给定时用**保守值 false**（软件 AEC3 / NS / AGC）。
+                        //     为什么不是"hw_aec 可用就用硬件"：实测（2026-10-13，台式机 Realtek 驱动）
+                        //     hw_aec 明明报 true，但**一旦真的启用硬件 AEC，随后的 start_recording 就会失败**
+                        //     （先建源再 StartRecording 失败；停采集→应用→再起也失败）→ 采集直接静默。
+                        //     要试硬件请显式写 Audio:NativePreferHardware=1。
+                        //   · 能力探测值照打出来，便于判断设备到底声称支持什么。
+                        let hw_aec = ffi_audio.audio.is_hardware_aec_available();
+                        let hw_agc = ffi_audio.audio.is_hardware_agc_available();
+                        let hw_ns = ffi_audio.audio.is_hardware_ns_available();
+                        let prefer_hw = options.prefer_hardware.unwrap_or(false);
+                        log::info!(
+                            "[PLATFORM_AUDIO_FFI] audio processing: prefer_hw={} (explicit={:?}, hw_aec={}, hw_agc={}, hw_ns={})",
+                            prefer_hw,
+                            options.prefer_hardware,
+                            hw_aec,
+                            hw_agc,
+                            hw_ns
+                        );
                         let processing_options = livekit::AudioProcessingOptions {
                             echo_cancellation: options.echo_cancellation,
                             noise_suppression: options.noise_suppression,
                             auto_gain_control: options.auto_gain_control,
-                            prefer_hardware_processing: options.prefer_hardware.unwrap_or(true),
+                            prefer_hardware_processing: prefer_hw,
                         };
                         if let Err(e) =
                             ffi_audio.audio.configure_audio_processing(processing_options)
@@ -73,6 +92,9 @@ impl FfiAudioSource {
                                 e
                             );
                         }
+                        // 注意：**不要**在这里顺手 stop → 应用 → start —— 实测启用硬件 AEC 后
+                        // start_recording 会失败（采集静默），而软件参数边跑边应用是安全的。
+
                     }
                 }
 
