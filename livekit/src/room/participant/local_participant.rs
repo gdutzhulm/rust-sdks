@@ -663,9 +663,25 @@ impl LocalParticipant {
         let publication = self.remove_publication(sid);
         if let Some(TrackPublication::Local(publication)) = publication {
             let track = publication.track().unwrap();
-            let sender = track.transceiver().unwrap().sender();
+            let transceiver = track.transceiver().unwrap();
+            let sender = transceiver.sender();
 
             self.inner.rtc_engine.remove_track(sender)?;
+
+            // ★ 视频轨：`remove_track` 只是把这条 m-line 变成"不再发送"，**不释放**它背后的
+            //   VideoSendStream（内含一个 `EncoderQueue` 线程）与编码器 —— 那些要等 PeerConnection
+            //   销毁（= 关闭会议）才回收。2026-10-13 本机实测：反复"开始/停止共享"每一轮都会新增一套，
+            //   线程名直方图里能直接看到 `EncoderQueue` 2→3→4→…，提交内存每轮 +100~256MB，只有关会才回落。
+            //   这里补一次 `stop()`：m-line 变 `inactive`（线上语义与原 `recvonly` 等价，服务端/其它端看到
+            //   "这一路不再发送"），但 libwebrtc 会随"已停止"真正把 send stream / 编码器 / 队列线程放掉。
+            //   下一次发布会**新建**一个 transceiver（SSRC、msid 都是新的），所以不影响服务端对"新发布的轨道"
+            //   的识别，也不影响其它客户端。
+            if matches!(track, LocalTrack::Video(_)) {
+                if let Err(e) = transceiver.stop() {
+                    log::warn!("failed to stop video transceiver after unpublish: {e:?}");
+                }
+            }
+
             track.set_transceiver(None);
 
             if let Some(local_track_unpublished) =
