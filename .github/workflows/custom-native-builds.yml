@@ -25,6 +25,10 @@ on:
       - 'webrtc-sys/**'
       - 'libwebrtc/**'
       - 'livekit-ffi/**'
+      # ★ `livekit/**` 必须在列：我们的几处定制就在那里（取消发布视频轨后 transceiver.stop()、
+      #   set_muted 对齐媒体层、platform_audio 热切换/ADM 收敛）。2026-10-13 就是因为它不在列，
+      #   这些修复不会触发 CI，出出来的 dylib/dll 会缺这些修复。
+      - 'livekit/**'
       - '.github/workflows/custom-native-builds.yml'
   workflow_dispatch:
 
