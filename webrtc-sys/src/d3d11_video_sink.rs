@@ -51,12 +51,19 @@ pub mod ffi {
             height: u32,
         );
         fn test_consume_once(sink: &SharedPtr<D3D11VideoSink>) -> bool;
+        fn test_acquire_consumer_key(sink: &SharedPtr<D3D11VideoSink>) -> bool;
+        fn test_release_consumer_key(sink: &SharedPtr<D3D11VideoSink>);
         fn test_read_texture(
             sink: &SharedPtr<D3D11VideoSink>,
             top_left_pixel: &mut u32,
             bottom_left_pixel: &mut u32,
         ) -> bool;
         fn test_frame_counter(sink: &SharedPtr<D3D11VideoSink>) -> i32;
+        fn test_acquire_consumer_key_for(
+            sink: &SharedPtr<D3D11VideoSink>,
+            timeout_ms: u32,
+        ) -> bool;
+        fn test_handback_count(sink: &SharedPtr<D3D11VideoSink>) -> i32;
         fn test_read_drop_counters(
             sink: &SharedPtr<D3D11VideoSink>,
             rate_limited: &mut i32,
@@ -119,6 +126,78 @@ mod tests {
         );
     }
 
+    /// **回归用例（2026-10-13）**：生产端"这一拍不写像素"（限速 / 被按住 / 退避）时，
+    /// **绝不能**把 keyed mutex 交还给消费端 —— 那会把生产端自己的轮次让出去。
+    ///
+    /// 为什么：keyed mutex 是**严格轮转**（空闲时只能按"上一次 release 的 key"取）。生产端要写帧，
+    /// 状态就必须停在"key 0 可用"；而观看侧两次显示之间会主动按住我们（`producer_active=0`）来省掉
+    /// 一次转换+上传，下一拍再松手让我们写。若在"不写"的分支里交还钥匙（状态变成 key 1 可用），
+    /// 松手后 `AcquireSync(0)` 会一直失败，而消费端只在**帧号变化**时才去合成 ⇒ 帧号永远不动。
+    /// VDI 现场就是这个指纹：帧号停在 2，4.5 秒后被判"没有新帧"而回退位图。
+    #[test]
+    fn skipped_frame_does_not_strand_the_producer() {
+        let sink = ffi::new_d3d11_video_sink(64, 32, 1); // 1fps：1 秒内的第二帧必被限速丢掉
+        assert!(sink.valid());
+
+        assert!(ffi::test_consume_once(&sink));
+        ffi::test_feed_split_frame(&sink, 64, 32);
+        assert_eq!(ffi::test_frame_counter(&sink), 1, "第一帧应该写进去");
+        assert!(ffi::test_consume_once(&sink), "消费端显示它 -> 钥匙轮到生产端");
+
+        ffi::test_feed_split_frame(&sink, 64, 32); // 限速：这一拍不写像素
+        assert_eq!(ffi::test_frame_counter(&sink), 1, "限速帧不该写进纹理");
+
+        // 等限速窗口过去：生产端必须还能写（钥匙没被让出去）。
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        ffi::test_feed_split_frame(&sink, 64, 32);
+        assert_eq!(
+            ffi::test_frame_counter(&sink),
+            2,
+            "跳写之后生产端必须还能写下一帧（钥匙没被让给消费端）"
+        );
+    }
+
+    /// 同上：被本端按住（观看侧省 CPU 的那一步）之后松手，生产端必须还能写。
+    #[test]
+    fn paused_frame_does_not_strand_the_producer() {
+        let sink = ffi::new_d3d11_video_sink(64, 32, 0);
+        assert!(sink.valid());
+
+        assert!(ffi::test_consume_once(&sink));
+        sink.set_producer_active(false); // 本端：这一拍不显示这块纹理
+        ffi::test_feed_split_frame(&sink, 64, 32);
+        assert_eq!(ffi::test_frame_counter(&sink), 0, "被按住时不该写纹理");
+
+        sink.set_producer_active(true); // 本端松手：紧接着就等我们出帧
+        ffi::test_feed_split_frame(&sink, 64, 32);
+        assert_eq!(
+            ffi::test_frame_counter(&sink),
+            1,
+            "松手后生产端必须还能写（钥匙没被让给消费端）"
+        );
+    }
+
+    /// 流被释放（原生退役）时，必须把还在等 key 1 的消费端**叫醒** ——
+    /// 否则那个合成线程会一直挂在纹理上，而调用方随后就会释放这一路原生流（"消费端还在用、原生在退役"）。
+    #[test]
+    fn retire_wakes_waiting_consumer() {
+        let sink = ffi::new_d3d11_video_sink(64, 32, 0);
+        assert!(sink.valid());
+
+        assert!(ffi::test_consume_once(&sink));
+        assert!(
+            !ffi::test_acquire_consumer_key_for(&sink, 100),
+            "这一拍钥匙在生产端手上，消费端本来就该等"
+        );
+
+        ffi::retire_d3d11_video_sink(&sink);
+        assert!(
+            ffi::test_acquire_consumer_key(&sink),
+            "退役时必须把钥匙交给等着的消费端"
+        );
+        assert!(ffi::test_handback_count(&sink) >= 1, "终态交还钥匙应该被记数");
+    }
+
     /// 生产端限速：max_fps 生效时，限速窗口内的帧**在转换之前**就被丢掉
     /// （连 I420->BGRA 都不做），所以帧序号不动 —— VDI 上 CPU 按显示帧率走。
     #[test]
@@ -152,6 +231,8 @@ mod tests {
         ));
         assert_eq!(rate_limited, 1, "被限速丢掉的那一帧应该计数");
         assert_eq!(consumer_absent, 0, "消费端在场时不该记「无宿主丢弃」");
+        // 注意：这一拍钥匙**已经在消费端那侧**（第一帧写完后没人取走），所以"交还"拿不到锁、计数不动。
+        // "跳写时必须交还钥匙"由 producer_hands_back_key_when_it_skips_writing 覆盖。
     }
 
     fn unpack(pixel: u32) -> (u8, u8, u8) {

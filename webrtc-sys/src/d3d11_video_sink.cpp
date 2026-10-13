@@ -60,11 +60,43 @@ constexpr DWORD kAcquireTimeoutMs = 50;
 //   3 = 消费端不在场丢弃：producer_active=0 或退避期丢掉的帧数
 // 于是 C# 侧可以算出一个"到 sink 的帧数 ≈ 写入 + 限速丢 + 无宿主丢"，
 // 一眼看出"远端推了多少、本端只转了多少"（VDI 上最关心的那笔账）。
-constexpr int kFrameSlotCount = 4;
+constexpr int kFrameSlotCount = 5;
 constexpr int kFrameIdSlot = 0;
 constexpr int kProducerActiveSlot = 1;
 constexpr int kRateLimitedDropSlot = 2;
 constexpr int kConsumerAbsentDropSlot = 3;
+// 4 = 生产端"把钥匙交还给消费端"的次数（诊断用：这条在涨 = 生产端一直在替消费端解套；
+// 为 0 而消费端的合成更新又等很久 = 钥匙真的被谁按住了）。
+constexpr int kTokenHandBackSlot = 4;
+
+// 销毁路径上"有界等消费端放手"的时间。见 HandBackConsumerKeyLocked 的说明：
+// 消费端那次 acquire 是**无限等**，所以销毁前必须把钥匙交还；但也不能为了等它而无限阻塞销毁。
+constexpr uint32_t kTeardownHandBackWaitMs = 100;
+
+/// 拿到 keyed mutex（key 0）之后的 RAII 守卫。
+///
+/// 协议是"生产端 acquire(0) → 写 → release(1)；消费端 acquire(1) → 读 → release(0)"的**严格轮转**，
+/// 而消费端等的是 `AcquireSync(key, int.MaxValue)`（Avalonia 的
+/// `AngleExternalMemoryD3D11Texture2D::AcquireKeyedMutex`，合成/渲染线程上）。也就是说：
+/// 钥匙只要漏在生产端手里，那个线程就**永远**不返回 —— 整个窗口不再重绘
+/// （现场：`一次合成更新耗时 4094 ms`、界面僵住、紧接着"消费端还在用、原生在退役"直接崩进程）。
+///
+/// 所以"拿到钥匙之后"的每一步都不允许提前 return：这个守卫保证任何出口都会 release(1)。
+struct KeyedMutexLease {
+  IDXGIKeyedMutex* mutex = nullptr;
+
+  explicit KeyedMutexLease(IDXGIKeyedMutex* m) : mutex(m) {}
+  ~KeyedMutexLease() {
+    if (mutex != nullptr) {
+      mutex->ReleaseSync(1);
+    }
+  }
+
+  KeyedMutexLease(const KeyedMutexLease&) = delete;
+  KeyedMutexLease& operator=(const KeyedMutexLease&) = delete;
+  KeyedMutexLease(KeyedMutexLease&&) = delete;
+  KeyedMutexLease& operator=(KeyedMutexLease&&) = delete;
+};
 
 double now_ms() {
   using namespace std::chrono;
@@ -180,6 +212,7 @@ D3D11VideoSink::D3D11VideoSink(uint32_t width, uint32_t height,
       slots[kProducerActiveSlot] = 1;
       slots[kRateLimitedDropSlot] = 0;
       slots[kConsumerAbsentDropSlot] = 0;
+      slots[kTokenHandBackSlot] = 0;
     }
   }
 
@@ -189,11 +222,11 @@ D3D11VideoSink::D3D11VideoSink(uint32_t width, uint32_t height,
   // （新建的 keyed mutex 初始就允许 acquire(0)，这里给个 1 秒上限只是不写 INFINITE。）
   auto& initial_bgra = *static_cast<std::vector<uint8_t>*>(bgra_);
   initial_bgra.assign(static_cast<size_t>(width_) * height_ * 4, 0);
-  if (SUCCEEDED((*mutex)->AcquireSync(0, 1000))) {
+  if ((*mutex)->AcquireSync(0, 1000) == S_OK) {
+    KeyedMutexLease lease((*mutex).Get());
     (*context)->UpdateSubresource(texture->Get(), 0, nullptr,
                                   initial_bgra.data(),
                                   static_cast<UINT>(width_) * 4, 0);
-    (*mutex)->ReleaseSync(1);
   }
 
   valid_ = true;
@@ -209,6 +242,19 @@ D3D11VideoSink::~D3D11VideoSink() {
 }
 
 void D3D11VideoSink::ReleaseResources() {
+  // ★ 销毁必须和**生产端自己的写线程**串行。以前这里不取 frame_mutex_，而 OnFrame 可能正拿着
+  //   钥匙在做 UpdateSubresource —— 此刻删掉纹理/上下文/设备是标准的 use-after-free
+  //   （现场：反复开关摄像头偶发"进程直接消失、日志截断"）。
+  std::unique_lock<std::mutex> teardown_lock(*static_cast<std::mutex*>(frame_mutex_));
+
+  // 先把自己关掉：这一行之后 OnFrame 再进来就直接返回，不会再有新的写。
+  valid_ = false;
+
+  // 再把钥匙交还给消费端（有界等它先放手）：这样"消费端那次等 key 1"立刻返回，
+  // 不会留下"消费端还在等 / 原生已经在退役纹理"的窗口。等不到也不阻塞销毁 ——
+  // 纹理还有 10 秒回收宽限（见 retire_d3d11_video_sink），没人引用时才会真被释放。
+  HandBackConsumerKeyLocked(kTeardownHandBackWaitMs);
+
   if (frame_view_ != nullptr) {
     UnmapViewOfFile(frame_view_);
     frame_view_ = nullptr;
@@ -230,6 +276,9 @@ void D3D11VideoSink::ReleaseResources() {
 }
 
 void D3D11VideoSink::set_producer_active(bool active) const {
+  // ★ 这个函数**只写标志位，绝不碰 keyed mutex**（2026-10-13 踩过，见 OnFrame 里被按住那一支的注释）：
+  //   观看侧"松手"（active=true）之后紧接着就等我们写帧，此刻钥匙必须是"key 0 可用"；
+  //   在这里交还钥匙等于把生产端自己的轮次让出去，帧号会永远停在原地。
   if (frame_view_ != nullptr) {
     static_cast<volatile LONG*>(frame_view_)[kProducerActiveSlot] = active ? 1 : 0;
   }
@@ -247,10 +296,6 @@ void D3D11VideoSink::retire_consumer_handshake() {
   }
 
   std::lock_guard<std::mutex> lock(*static_cast<std::mutex*>(frame_mutex_));
-  auto* mutex = static_cast<ComPtr<IDXGIKeyedMutex>*>(keyed_mutex_);
-  if (mutex == nullptr || !*mutex) {
-    return;
-  }
 
   // 只做**非阻塞**的唤醒：如果有消费端正等着 key 1，这里把 key 1 交给它。
   //
@@ -258,10 +303,31 @@ void D3D11VideoSink::retire_consumer_handshake() {
   // 实测那一次等待在最常见的"最后一帧已经显示过、之后没有新帧"的情况下会**等满 5 秒**，
   // 现场表现就是"结束共享的瞬间整个界面停住、点什么都没反应"。
   // 消费端拿到 key 后自己会释放 key 0；纹理本身还有 10 秒的回收宽限，不需要在这里同步等。
-  if (SUCCEEDED((*mutex)->AcquireSync(0, 0))) {
-    (*mutex)->ReleaseSync(1);
-  } else if (SUCCEEDED((*mutex)->AcquireSync(1, 0))) {
-    (*mutex)->ReleaseSync(1);
+  HandBackConsumerKeyLocked(0);
+}
+
+void D3D11VideoSink::HandBackConsumerKeyLocked(uint32_t timeout_ms) const {
+  auto* mutex = static_cast<ComPtr<IDXGIKeyedMutex>*>(keyed_mutex_);
+  if (mutex == nullptr || !*mutex) {
+    return;
+  }
+
+  // **只允许在"生产端再也不会写帧"的终态调用**（退役 / 销毁 / 根本没有共享内存可写）：
+  //   · 只有"无人持有 + 上次释放的是 key 0"这一态才拿得到，而那一态正是**消费端拿不到 key 1** 的态
+  //     （它此刻若在等，就是无限等，见 Avalonia 的 AcquireSync(key, int.MaxValue)）；
+  //   · 拿到就立刻以 key 1 还给消费端：内容一个字节都没动，它读到的还是最后一帧，属于"合法唤醒"。
+  //   · 其余两种情况都是空操作：钥匙已经在消费端手上（它会自己还）/ 已经摆着等它来取。
+  // **中途的"这一拍不写"（被按住 / 限速 / 退避）绝不能调**：那会把生产端自己的轮次让出去，
+  //   帧号会永远停在原地（2026-10-13 的回归）。
+  // timeout_ms = 0 → 非阻塞；销毁路径传几十毫秒 → 先让消费端拷完再交还。
+  if ((*mutex)->AcquireSync(0, timeout_ms) != S_OK) {
+    return;
+  }
+  (*mutex)->ReleaseSync(1);
+
+  if (frame_view_ != nullptr) {
+    InterlockedIncrement(static_cast<volatile LONG*>(frame_view_) +
+                         kTokenHandBackSlot);
   }
 }
 
@@ -272,11 +338,19 @@ void D3D11VideoSink::OnFrame(const webrtc::VideoFrame& frame) {
   }
 
   std::lock_guard<std::mutex> lock(*static_cast<std::mutex*>(frame_mutex_));
-  if (!valid_ || frame_view_ == nullptr) {
+  if (!valid_) {
+    return;
+  }
+  if (frame_view_ == nullptr) {
+    HandBackConsumerKeyLocked(0);
     return;
   }
   if (static_cast<volatile LONG*>(frame_view_)[kProducerActiveSlot] == 0) {
     CountDrop(kConsumerAbsentDropSlot);   // 本端明确表示"没人看这块纹理"
+    // ★ 这里**不能**交还钥匙（2026-10-13 踩过）：观看侧按住我们只是为了省掉这一次"转换+上传"，
+    //   下一拍它就会松手让我们写。若此刻把钥匙交给消费端，状态变成"key 1 可被取"，
+    //   而我们写帧需要的是"key 0 可被取" —— 松手后 AcquireSync(0) 会一直失败，
+    //   消费端又只在帧号变化时才合成 ⇒ 帧号永远不动（VDI 现场：帧号停在 2、4.5 秒后判"没有新帧"）。
     return;
   }
 
@@ -284,7 +358,7 @@ void D3D11VideoSink::OnFrame(const webrtc::VideoFrame& frame) {
   // 别把 WebRTC 的视频线程耗在没人看的帧上。
   if (now_ms() < skip_until_ms_) {
     CountDrop(kConsumerAbsentDropSlot);
-    return;
+    return;   // 同上：退避只是"这一拍不写"，钥匙必须留在"key 0 可用"这一态
   }
 
   // 本端（观看侧）写纹理限速（max_fps>0 时）：还没到下一次允许写纹理的时间 -> 整帧丢掉。
@@ -293,7 +367,7 @@ void D3D11VideoSink::OnFrame(const webrtc::VideoFrame& frame) {
   // 对端推 30~60fps、本端只显示 15fps 时，剩下的转换与上传全是白烧的 CPU。
   if (min_interval_ms_ > 0 && now_ms() - last_write_ms_ < min_interval_ms_) {
     CountDrop(kRateLimitedDropSlot);
-    return;
+    return;   // 同上：限速丢的这一帧也不许交还钥匙
   }
 
   auto* mutex = static_cast<ComPtr<IDXGIKeyedMutex>*>(keyed_mutex_);
@@ -397,13 +471,25 @@ void D3D11VideoSink::OnFrame(const webrtc::VideoFrame& frame) {
   // 转换做完才抢 key：keyed mutex 只覆盖"上传"这一段，消费端（合成线程）等的时间才短。
   // 这里也**不能**用 INFINITE —— 消费端消失时那会把 WebRTC 的视频线程永久卡住
   // （连带整条轨道的投递都停在那一帧上）。
-  if (FAILED((*mutex)->AcquireSync(0, kAcquireTimeoutMs))) {
+  if ((*mutex)->AcquireSync(0, kAcquireTimeoutMs) != S_OK) {
     skip_until_ms_ = now_ms() + kConsumerAbsentBackoffMs;
     return;
   }
-  (*context)->UpdateSubresource(texture->Get(), 0, nullptr, bgra.data(),
-                                static_cast<UINT>(width_) * 4, 0);
-  (*mutex)->ReleaseSync(1);
+  // ★★ 这里**必须**用 `== S_OK` 判，不能写 FAILED(...)：AcquireSync 超时返回的是 WAIT_TIMEOUT(0x102)，
+  //    它的最高位是 0，`FAILED()` 会判成 false —— 于是"没抢到锁"也会往下走：在消费端**正拷贝这块纹理**
+  //    的时候 UpdateSubresource（撕裂/花屏），再 ReleaseSync(1) 被 DXGI 直接拒掉（DXGI_ERROR_INVALID_CALL，
+  //    状态不变），帧号却照样 +1 → 消费端认到"有新帧"去合成，而钥匙其实还在它自己那侧 →
+  //    它那次 `AcquireSync(1, int.MaxValue)` 就无限等（现场：`一次合成更新耗时 4094 ms`、界面僵住、随后崩）。
+  //    2026-10-13 用探针把 keyed mutex 的状态机逐条测了出来才确认这一点：
+  //    空闲时 `acquire(0,0)=WAIT_TIMEOUT / acquire(1,0)=S_OK`（钥匙在消费端那侧）；
+  //    消费端 release(0) 之后反过来；未持有就 release 会得到 DXGI_ERROR_INVALID_CALL。
+  //    回归用例外层已覆盖（producer_hands_back_key_when_it_skips_writing 等）。
+  // ★ 钥匙已经到手：从这里开始**任何**出口都必须走 release(1)（守卫的就是那个"漏钥匙"的崩点）。
+  {
+    KeyedMutexLease lease((*mutex).Get());
+    (*context)->UpdateSubresource(texture->Get(), 0, nullptr, bgra.data(),
+                                  static_cast<UINT>(width_) * 4, 0);
+  }
   last_write_ms_ = now_ms();
   if (frame_view_ != nullptr) {
     InterlockedIncrement(static_cast<volatile LONG*>(frame_view_) + kFrameIdSlot);
@@ -456,7 +542,7 @@ bool test_consume_once(const std::shared_ptr<D3D11VideoSink>& sink) {
   if (mutex == nullptr || !*mutex) {
     return false;
   }
-  if (FAILED((*mutex)->AcquireSync(1, 1000))) {
+  if ((*mutex)->AcquireSync(1, 1000) != S_OK) {
     return false;
   }
   (*mutex)->ReleaseSync(0);
@@ -464,6 +550,11 @@ bool test_consume_once(const std::shared_ptr<D3D11VideoSink>& sink) {
 }
 
 bool test_acquire_consumer_key(const std::shared_ptr<D3D11VideoSink>& sink) {
+  return test_acquire_consumer_key_for(sink, 0);
+}
+
+bool test_acquire_consumer_key_for(const std::shared_ptr<D3D11VideoSink>& sink,
+                                   uint32_t timeout_ms) {
   if (!sink) {
     return false;
   }
@@ -471,7 +562,11 @@ bool test_acquire_consumer_key(const std::shared_ptr<D3D11VideoSink>& sink) {
   if (mutex == nullptr || !*mutex) {
     return false;
   }
-  return SUCCEEDED((*mutex)->AcquireSync(1, 0));
+  // 语义与消费端一致（Avalonia 是 int.MaxValue 无限等，这里给个上限好让用例能失败退出）：
+  // 拿不到 key 1 就是"消费端那一等不会返回"。
+  // 注意这里**不能**写 SUCCEEDED(...)：AcquireSync 超时返回 WAIT_TIMEOUT(0x102)，它的最高位是 0，
+  // SUCCEEDED 会返回 true —— 那等于"超时也算拿到了"，这个用例就永远测不出问题。
+  return (*mutex)->AcquireSync(1, timeout_ms) == S_OK;
 }
 
 void test_release_consumer_key(const std::shared_ptr<D3D11VideoSink>& sink) {
@@ -501,7 +596,7 @@ bool test_read_texture(const std::shared_ptr<D3D11VideoSink>& sink,
     return false;
   }
 
-  if (FAILED((*mutex)->AcquireSync(1, 1000))) {
+  if ((*mutex)->AcquireSync(1, 1000) != S_OK) {
     return false;
   }
 
@@ -531,6 +626,13 @@ bool test_read_texture(const std::shared_ptr<D3D11VideoSink>& sink,
 
   (*mutex)->ReleaseSync(0);
   return ok;
+}
+
+int32_t test_handback_count(const std::shared_ptr<D3D11VideoSink>& sink) {
+  if (!sink || sink->frame_view_ == nullptr) {
+    return -1;
+  }
+  return static_cast<volatile LONG*>(sink->frame_view_)[kTokenHandBackSlot];
 }
 
 int32_t test_frame_counter(const std::shared_ptr<D3D11VideoSink>& sink) {

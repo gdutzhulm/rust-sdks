@@ -46,6 +46,23 @@ class D3D11VideoSink : public webrtc::VideoSinkInterface<webrtc::VideoFrame> {
  private:
   void ReleaseResources();
 
+  /// 把 keyed mutex 的钥匙**交还消费端**（唤醒可能正在等 key 1 的合成线程）。
+  ///
+  /// ★ **只允许在生产端的终态调用**：`retire_consumer_handshake()`、`ReleaseResources()`，以及
+  /// "根本没有共享内存可写"那条路（`OnFrame` 里 `frame_view_ == nullptr`）。
+  ///
+  /// 为什么不能在中途调：keyed mutex 是**严格轮转**（生产端 acquire(0) → release(1)；消费端
+  /// acquire(1) → release(0)，空闲时只能按"上一次 release 的 key"取）。生产端要写帧就必须让状态停在
+  /// "key 0 可用"；而观看侧两次显示之间会主动"按住"我们（`producer_active=0`）以省掉一次转换+上传，
+  /// 下一拍再松手让我们写。若在被按住/限速/退避这些"这一拍不写"的分支里交还钥匙，状态就变成
+  /// "key 1 可用"，松手后 `AcquireSync(0)` 会一直失败，而消费端只在帧号变化时才合成 ⇒ **帧号永远不动**
+  /// （2026-10-13 VDI 现场：帧号停在 2、4.5 秒后被判"没有新帧"而回退位图）。
+  ///
+  /// 非阻塞探测：只有"无人持有 + 上次 release 的是 key 0"才拿得到，拿到就 release(1)（内容不动）；
+  /// 其余情况空操作。调用方必须已持有 frame_mutex_。
+  /// <param name="timeout_ms">0 = 非阻塞；销毁路径传几十毫秒，先让消费端拷完再交还。</param>
+  void HandBackConsumerKeyLocked(uint32_t timeout_ms) const;
+
   /// 记一次"丢掉"（写共享内存里的计数，C# 用它算"到 sink 的帧数 vs 实际写入帧数"）。
   /// slot 布局见 cpp 里的 kFrameSlotCount 说明。
   void CountDrop(int slot) const;
@@ -91,11 +108,14 @@ class D3D11VideoSink : public webrtc::VideoSinkInterface<webrtc::VideoFrame> {
                                     uint32_t width, uint32_t height);
   friend bool test_consume_once(const std::shared_ptr<D3D11VideoSink>& sink);
   friend bool test_acquire_consumer_key(const std::shared_ptr<D3D11VideoSink>& sink);
+  friend bool test_acquire_consumer_key_for(
+      const std::shared_ptr<D3D11VideoSink>& sink, uint32_t timeout_ms);
   friend void test_release_consumer_key(const std::shared_ptr<D3D11VideoSink>& sink);
   friend bool test_read_texture(const std::shared_ptr<D3D11VideoSink>& sink,
                                 uint32_t& top_left_pixel,
                                 uint32_t& bottom_left_pixel);
   friend int32_t test_frame_counter(const std::shared_ptr<D3D11VideoSink>& sink);
+  friend int32_t test_handback_count(const std::shared_ptr<D3D11VideoSink>& sink);
   friend bool test_read_drop_counters(const std::shared_ptr<D3D11VideoSink>& sink,
                                       int32_t& rate_limited,
                                       int32_t& consumer_absent);
@@ -115,6 +135,14 @@ bool test_consume_once(const std::shared_ptr<D3D11VideoSink>& sink);
 /// 模拟"合成线程正在拷贝"（acquire key 1，先不还）与"拷完了"（release key 0）。
 /// 用来验证生产端在消费端占着纹理时**不会无限等待**。
 bool test_acquire_consumer_key(const std::shared_ptr<D3D11VideoSink>& sink);
+
+/// 同 test_acquire_consumer_key，但可以给一个等待上限。
+/// 消费端（Avalonia）真实用的是**无限等**，所以"拿不到 key 1"就等于"整个窗口不再重绘"。
+bool test_acquire_consumer_key_for(const std::shared_ptr<D3D11VideoSink>& sink,
+                                   uint32_t timeout_ms);
+
+/// 读共享内存里的"生产端交还钥匙"累计次数（诊断：这条在涨 = 生产端一直在替消费端解套）。
+int32_t test_handback_count(const std::shared_ptr<D3D11VideoSink>& sink);
 void test_release_consumer_key(const std::shared_ptr<D3D11VideoSink>& sink);
 
 /// 读回共享纹理的左上/左下角像素（BGRA 打包进 uint32，低字节为 B）。
