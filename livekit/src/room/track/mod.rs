@@ -208,16 +208,23 @@ pub(super) fn new_inner(
 
 /// This is only called for local tracks
 pub(super) fn set_muted(inner: &Arc<TrackInner>, track: &Track, muted: bool) {
-    let info = inner.info.read();
-    if info.muted == muted {
-        return;
-    }
-    drop(info);
+    let changed = {
+        let info = inner.info.read();
+        info.muted != muted
+    };
 
-    if muted {
-        inner.rtc_track.set_enabled(false);
-    } else {
-        inner.rtc_track.set_enabled(true);
+    // **媒体层永远对齐，不看 info.muted 的旧值**（2026-10-13 修：此前是"info.muted 已经等于目标值就直接 return"）。
+    //
+    // 为什么要改：本项目的入会请求是 `openMicrophone:0`，于是**服务端/房间信息会把这条本地音频轨标成 muted=true**
+    // （info.muted = true），而此时底层 webrtc 轨其实还是 enabled —— 旧写法在这种情况下直接 return，
+    // 从没调用过 `set_enabled(false)`，于是出现"界面显示已静音、引擎却仍在推流"：
+    // 实测「入会静音」状态下本端仍以 **约 45 kbps** 持续向 SFU 发 Opus（对端因 publication 被标 muted 而听不到，
+    // 所以此前没被发现，但白费带宽与编码 CPU，而且"静音"在链路上并不真的停）。
+    // 现在：`set_enabled` 每次都调（幂等），只有"状态真的变了"才改 info 并抛事件。
+    inner.rtc_track.set_enabled(!muted);
+
+    if !changed {
+        return;
     }
 
     inner.info.write().muted = muted;
