@@ -10,6 +10,8 @@
 
 # 📹🎙️🦀 Rust Client SDK for LiveKit
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 <!--BEGIN_DESCRIPTION-->
 Use this SDK to add realtime video, audio and data features to your Rust app. By connecting to <a href="https://livekit.io/">LiveKit</a> Cloud or a self-hosted server, you can quickly build applications such as multi-modal AI, live streaming, or video calls with just a few lines of code.
 <!--END_DESCRIPTION-->
