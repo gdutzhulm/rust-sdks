@@ -29,6 +29,9 @@ on:
       #   set_muted 对齐媒体层、platform_audio 热切换/ADM 收敛）。2026-10-13 就是因为它不在列，
       #   这些修复不会触发 CI，出出来的 dylib/dll 会缺这些修复。
       - 'livekit/**'
+      # livekit-protocol 的 .proto 会生成 livekit-ffi 用到的消息类型（改协议 = 改 FFI 产物），
+      # 2026-10-16 补：原来它不在白名单里，改了 proto 不会触发构建，产物会悄悄缺字段。
+      - 'livekit-protocol/**'
       - '.github/workflows/custom-native-builds.yml'
   workflow_dispatch:
 
