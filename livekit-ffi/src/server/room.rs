@@ -1367,8 +1367,13 @@ async fn forward_event(
         RoomEvent::ActiveSpeakersChanged { speakers } => {
             let participant_identities =
                 speakers.iter().map(|p| p.identity().to_string()).collect::<Vec<_>>();
+            // 与上面一一对应的音量（0..1）：上层用它画音浪 —— 服务端已经算好，客户端不必再收 PCM 算 RMS。
+            let participant_levels =
+                speakers.iter().map(|p| p.audio_level() as f64).collect::<Vec<_>>();
 
-            let _ = send_event(proto::ActiveSpeakersChanged { participant_identities }.into());
+            let _ = send_event(
+                proto::ActiveSpeakersChanged { participant_identities, participant_levels }.into(),
+            );
         }
         RoomEvent::ConnectionQualityChanged { quality, participant } => {
             let _ = send_event(

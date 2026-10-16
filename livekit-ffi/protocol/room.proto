@@ -588,7 +588,13 @@ message E2eeStateChanged {
   required EncryptionState state = 2;
 }
 
-message ActiveSpeakersChanged { repeated string participant_identities = 1; }
+message ActiveSpeakersChanged {
+  repeated string participant_identities = 1;
+  // 与 participant_identities 一一对应的"说话音量"（0..1，服务端聚合的 audio_level）。
+  // 老客户端忽略未知字段、行为不变；上层（C# SDK / MeetingSample）用它画成员卡片的音浪 ——
+  // 这样"谁在说话 + 多大声"都走这一条房间事件，不必各自收 PCM 算 RMS（2026-10-16 定制）。
+  repeated double participant_levels = 2;
+}
 
 message RoomMetadataChanged {
   required string metadata = 1;
