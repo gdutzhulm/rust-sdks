@@ -228,6 +228,38 @@ git diff upstream/main...custom/d3d11-video-sink     # 21 个文件，+2587 / -1
 - `.github/workflows/custom-native-builds.yml`：手动触发（`workflow_dispatch`），产出 **`livekit_ffi.dll`（Windows x64）** 与 **`liblivekit_ffi.dylib`（macOS arm64 / x64）** —— 上层 C# SDK 里的原生库就来自这里。
 - `.github/matchers/clang.json`：把 C++ 编译错误转成 GitHub 注解；构建失败时还会把 `build.log` 尾巴贴成 commit 评论，方便直接定位。
 
+### 5. 解码后真实帧尺寸 + 关键帧请求（观看端首帧 / 竖横屏切换）
+
+- **共享纹理里多写两个槽位**：`webrtc-sys/src/d3d11_video_sink.cpp` 的帧计数共享内存从 5 个 LONG 扩到 **7 个**，
+  `slot 5/6 = 解码后的真实帧宽高`（每写成一帧更新，且在帧号 +1 之前发布）。
+  纹理宽高在建流时就定死了，源换方向（手机竖屏 ↔ 横屏）时原生只能把新画面**等比塞进旧纹理并居中留黑**，
+  上层再按纹理比例摆放就是"中间一条小画面"。有了这两个槽，观看侧（`GpuTexturePresenter`）能立刻发现
+  "纹理比例 ≠ 源比例"并**按新尺寸重建纹理**。冒烟用例：`test_read_frame_size`。
+- **macOS 同款**：`webrtc-sys/src/iosurface_video_sink.cpp` 的计数器文件 `/tmp/livekit_gpu_frame_<句柄>` 也从
+  4 个 int32 扩到 **7 个**，同样在帧号 +1 之前写 `slot 5/6`。C# 侧 `GpuTexturePresenter` 是同一套读法
+  （按 7/5/4/2 逐级退让打开映射），所以两边行为一致。冒烟用例：`test_read_frame_size_iosurface`。
+- **主动请求关键帧**：`webrtc-sys` 的 `VideoTrack::request_refresh_frame()` 走
+  **`track()->GetSource()->GenerateKeyFrame()`**（远端轨 = `VideoRtpTrackSource`，它只实现了
+  `GenerateKeyFrame()`，会经 `VideoRtpReceiver` → `VideoReceiveStream` 向发送端发 **RTCP PLI/FIR**），
+  再补一次 `RequestRefreshFrame()`（本地摄像头预览走这条）；
+  ⚠️ **别只调 `RequestRefreshFrame()`**：在远端源上它落到 `VideoSourceInterface` 的**空实现**，
+  调了等于没调（2026-10-20 现场：连发 6 次"请求"，`到 sink ≈ 0 帧`，人一直看灰屏）；
+  再往上依次是 `libwebrtc::RtcVideoTrack::request_refresh_frame()`、
+  `livekit::RemoteVideoTrack::request_key_frame()`、`livekit::Track::request_key_frame()`，
+  最后在 `livekit-ffi/src/cabi.rs` 导出 C ABI：
+
+  ```c
+  bool livekit_video_track_request_keyframe(uint64_t track_handle);
+  ```
+
+  场景：订阅端入会 / 重建纹理时，发送端可能正落在两个关键帧之间；画面完全静止（PPT、白板、不动的桌面）
+  时它可能几十秒都不产关键帧，本端解码器一帧都出不来（现场：入会后一直停在头像墙，直到对方动一下画面）。
+  旧版本没有这个导出，语言绑定按 `EntryPointNotFoundException` 降级即可。
+  **平台无关**：导出在 `livekit-ffi/src/cabi.rs`，`VideoTrack::request_refresh_frame()` 在共享 C++ 里，
+  Windows / macOS / Linux 一样可用（各自的产物都要重新编译才带得动）。
+- `webrtc-sys/build.rs`：Windows 分支补 `/utf-8`。源码里有大量中文注释，MSVC 默认按系统代码页（GBK）解析时，
+  某些 UTF-8 字节序列会被拼成"行尾反斜杠"把下一行吞进注释，报出来的却是几十行之后"某某未声明"。
+
 ### 升级上游
 
 定制都在 `custom/*` 分支上，`main` 只跟随 `upstream/main`。升级步骤见主仓 `tools/native-d3d11-sink/UPGRADE.md`（配 `setup-custom-repo.ps1` 可一键把定制补丁打到新的上游 tag 上）。

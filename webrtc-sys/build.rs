@@ -183,6 +183,10 @@ fn main() {
                 //.file("src/vaapi/vaapi_encoder_factory.cpp")
                 //.file("src/vaapi/h264_encoder_impl.cpp")
                 .flag("/std:c++20")
+                // 源码里有大量中文注释（UTF-8）。MSVC 默认按系统代码页（本机 936/GBK）解析，
+                // 会把某些 UTF-8 字节序列拼成"行尾反斜杠"，把下一行吞进注释里 —— 报出来的却是
+                // 后面几十行"某某未声明"。显式声明源码字符集，一劳永逸。
+                .flag("/utf-8")
                 //.flag("/wd4819")
                 //.flag("/wd4068")
                 .flag("/EHsc");

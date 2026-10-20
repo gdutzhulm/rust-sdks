@@ -112,6 +112,29 @@ void VideoTrack::set_should_receive(bool should_receive) const {
   track()->set_should_receive(should_receive);
 }
 
+uint32_t VideoTrack::request_refresh_frame() const {
+  // **远端轨只有 `source->GenerateKeyFrame()` 真正会发 PLI/FIR**，这是踩过的坑：
+  //
+  //   · 视频接收端用的源是 `webrtc::VideoRtpTrackSource`（pc/video_rtp_track_source.h），
+  //     它只实现了 `GenerateKeyFrame()`（→ VideoRtpReceiver::OnGenerateKeyFrame →
+  //     VideoReceiveStream::GenerateKeyFrame → 给发送端发 RTCP PLI/FIR）；
+  //   · 而 `RequestRefreshFrame()` 在它身上落到 `VideoSourceInterface` 的**空实现**，
+  //     调了等于什么都没做 —— 现场（2026-10-20 09:12:28）就是：入会后每 0.3/0.6/1.2s
+  //     连发 4 次"关键帧请求"，日志都打了，但直到 **4.2 秒**后才出首帧 ——
+  //     那只是发送端自己的周期关键帧，不是我们请求来的。
+  //
+  // 本地轨（摄像头预览）反过来：`pc::VideoTrackSource::GenerateKeyFrame()` 是空实现，
+  // `RequestRefreshFrame()` 才管用。所以两个都调，互不干扰。
+  auto* track_interface = track();
+  if (auto* source = track_interface->GetSource()) {
+    source->GenerateKeyFrame();
+    track_interface->RequestRefreshFrame();
+    return 1;   // 1 = 已向源请求（远端轨 = 已发 RTCP PLI/FIR）
+  }
+  track_interface->RequestRefreshFrame();
+  return 2;     // 2 = 没有 source（理论上不该出现，出现就说明不是普通 VideoTrack）
+}
+
 bool VideoTrack::should_receive() const {
   return track()->should_receive();
 }

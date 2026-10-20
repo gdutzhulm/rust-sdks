@@ -63,6 +63,9 @@ class VideoTrack : public MediaStreamTrack {
   void remove_sink(const std::shared_ptr<NativeVideoSink>& sink) const;
 
   void set_should_receive(bool should_receive) const;
+  /// 请求底层源刷新一帧（远端轨会向发送端发 PLI/关键帧请求）。
+  /// 返回值：1 = 已向源请求；2 = 没有 source；0 = 未处理。
+  uint32_t request_refresh_frame() const;
   bool should_receive() const;
   ContentHint content_hint() const;
   void set_content_hint(ContentHint hint) const;

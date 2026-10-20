@@ -103,6 +103,26 @@ pub unsafe extern "C" fn livekit_ffi_request(
     }
 }
 
+/// 请求远端视频轨立刻发一帧关键帧（PLI/FIR）。
+///
+/// 给 C# 等语言绑定直接调用（不经过 protobuf 请求总线）：订阅端入会 / 重建纹理时，
+/// 发送端可能正落在两个关键帧之间，静态画面下会一直黑屏。返回 false = 句柄不是视频轨 /
+/// 不是远端轨 / 句柄已失效（调用方按"不支持"降级即可）。
+#[no_mangle]
+pub extern "C" fn livekit_video_track_request_keyframe(track_handle: FfiHandleId) -> bool {
+    let track = match FFI_SERVER.retrieve_handle::<server::room::FfiTrack>(track_handle) {
+        Ok(track) => track,
+        Err(err) => {
+            log::warn!("livekit_video_track_request_keyframe: {err:?}");
+            return false;
+        }
+    };
+    let code = track.track.request_key_frame();
+    // 1 = 已向源请求（远端轨 = 已发 RTCP PLI/FIR）；0 = 不是远端视频轨；2 = 该 VideoTrack 没有 source。
+    log::info!("livekit_video_track_request_keyframe: handle={track_handle}, result={code}");
+    code != 0
+}
+
 #[no_mangle]
 pub extern "C" fn livekit_ffi_drop_handle(handle_id: FfiHandleId) -> bool {
     FFI_SERVER.drop_handle(handle_id)

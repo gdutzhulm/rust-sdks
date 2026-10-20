@@ -20,6 +20,7 @@ use livekit::{
         video_stream::native::{NativeVideoStream, NativeVideoStreamOptions},
     },
 };
+use std::time::{Duration, Instant};
 
 #[cfg(target_os = "macos")]
 use livekit::webrtc::video_stream::iosurface::IOSurfaceVideoStream;
@@ -88,11 +89,13 @@ impl FfiVideoStream {
                         .queue_size_frames
                         .map(|capacity| capacity as usize),
                 };
+                let max_fps = new_stream.max_fps.unwrap_or(0);
                 let handle = server.async_runtime.spawn(Self::native_video_stream_task(
                     server,
                     handle_id,
                     new_stream.format.and_then(|_| Some(new_stream.format())),
                     new_stream.normalize_stride.unwrap_or(true),
+                    max_fps,
                     NativeVideoStream::with_options(rtc_track, options),
                     self_dropped_rx,
                     server.watch_handle_dropped(new_stream.track_handle),
@@ -217,11 +220,22 @@ impl FfiVideoStream {
         stream_handle: FfiHandleId,
         dst_type: Option<proto::VideoBufferType>,
         normalize_stride: bool,
+        max_fps: u32,
         mut native_stream: NativeVideoStream,
         mut self_dropped_rx: oneshot::Receiver<()>,
         mut handle_dropped_rx: oneshot::Receiver<()>,
         send_eos: bool,
     ) {
+        // 本端消费限速：超过目标帧率的已解码帧在 **colorcvt 之前** 直接丢弃。
+        // NativeVideoStream 是同一路 RtcVideoTrack 上的另一个 sink，不会重新解码；
+        // 这里省掉的是对每一帧都做 I420→RGBA 转换以及跨 FFI 事件派发的 CPU。
+        let min_frame_interval = if max_fps == 0 {
+            None
+        } else {
+            Some(Duration::from_secs_f64(1.0 / max_fps as f64))
+        };
+        let mut last_converted_at: Option<Instant> = None;
+
         loop {
             tokio::select! {
                 _ = &mut self_dropped_rx => {
@@ -234,6 +248,16 @@ impl FfiVideoStream {
                     let Some(frame) = frame else {
                         break;
                     };
+
+                    if let Some(min_interval) = min_frame_interval {
+                        let now = Instant::now();
+                        if last_converted_at
+                            .is_some_and(|last| now.duration_since(last) < min_interval)
+                        {
+                            continue;
+                        }
+                        last_converted_at = Some(now);
+                    }
 
                     let metadata = frame_metadata_to_proto(frame.frame_metadata);
                     let timestamp_us = frame.timestamp_us;
@@ -350,6 +374,7 @@ impl FfiVideoStream {
                         stream_handle,
                         dst_type,
                         normalize_stride,
+                        0,
                         NativeVideoStream::with_options(rtc_track, options),
                         c_rx,
                         handle_dropped_rx,

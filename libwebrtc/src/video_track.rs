@@ -45,6 +45,12 @@ impl RtcVideoTrack {
     pub fn packet_trailer_handler(&self) -> Option<PacketTrailerHandler> {
         self.handle.packet_trailer_handler()
     }
+
+    /// 请求底层源刷新一帧。对**远端视频轨**就是向发送端发 PLI/FIR（要关键帧），
+    /// 用于订阅端刚入会 / 重建纹理时尽快拿到首帧（静态画面下发送端可能很久不产关键帧）。
+    pub fn request_refresh_frame(&self) -> u32 {
+        self.handle.request_refresh_frame()
+    }
 }
 
 impl Debug for RtcVideoTrack {

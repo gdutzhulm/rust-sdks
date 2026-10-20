@@ -119,6 +119,8 @@ class D3D11VideoSink : public webrtc::VideoSinkInterface<webrtc::VideoFrame> {
   friend bool test_read_drop_counters(const std::shared_ptr<D3D11VideoSink>& sink,
                                       int32_t& rate_limited,
                                       int32_t& consumer_absent);
+  friend bool test_read_frame_size(const std::shared_ptr<D3D11VideoSink>& sink,
+                                 uint32_t& width, uint32_t& height);
 };
 
 // ---- 冒烟测试支持（正式路径不使用）----
@@ -157,6 +159,10 @@ int32_t test_frame_counter(const std::shared_ptr<D3D11VideoSink>& sink);
 bool test_read_drop_counters(const std::shared_ptr<D3D11VideoSink>& sink,
                              int32_t& rate_limited,
                              int32_t& consumer_absent);
+
+/// 读共享内存里的“解码后真实帧宽高”（slot 5/6）。
+bool test_read_frame_size(const std::shared_ptr<D3D11VideoSink>& sink,
+                           uint32_t& width, uint32_t& height);
 
 void retire_d3d11_video_sink(const std::shared_ptr<D3D11VideoSink>& sink);
 

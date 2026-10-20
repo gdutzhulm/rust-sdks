@@ -53,12 +53,20 @@ double now_ms() {
 constexpr double kConsumerAbsentBackoffMs = 200.0;
 
 // 计数器共享内存的槽位布局（与 Windows 版逐位一致，C# 侧同一套读法）：
-//   0 = 已写成的帧号，1 = producer_active，2 = 限速丢弃，3 = 消费端不在场丢弃。
-constexpr int kFrameSlotCount = 4;
+//   0 = 已写成的帧号，1 = producer_active，2 = 限速丢弃，3 = 消费端不在场丢弃，
+//   5/6 = **解码后的真实帧宽高**（每写成一帧更新）。
+//
+// 为什么 mac 也要这两个槽：IOSurface 的宽高在 `new_iosurface_video_sink()` 时定死，
+// 源换方向（手机竖屏 ↔ 横屏）时这里只能把新画面**等比塞进旧 surface 并居中留黑**，
+// 上层再按 surface 比例摆放就是"中间一条小画面"。观看端（GpuTexturePresenter）
+// 读 slot 5/6 发现"surface 比例 ≠ 源比例"后会按新尺寸重建 surface。
+constexpr int kFrameSlotCount = 7;
 constexpr int kFrameIdSlot = 0;
 constexpr int kProducerActiveSlot = 1;
 constexpr int kRateLimitedDropSlot = 2;
 constexpr int kConsumerAbsentDropSlot = 3;
+constexpr int kSrcWidthSlot = 5;
+constexpr int kSrcHeightSlot = 6;
 constexpr int kCounterSize = kFrameSlotCount * 4;
 
 }  // namespace
@@ -191,6 +199,8 @@ void IOSurfaceVideoSink::OpenFrameCounter() {
   slots[kProducerActiveSlot] = 1;
   slots[kRateLimitedDropSlot] = 0;
   slots[kConsumerAbsentDropSlot] = 0;
+  slots[kSrcWidthSlot] = 0;
+  slots[kSrcHeightSlot] = 0;
 }
 
 void IOSurfaceVideoSink::set_producer_active(bool active) const {
@@ -341,6 +351,9 @@ void IOSurfaceVideoSink::OnFrame(const webrtc::VideoFrame& frame) {
 
   last_write_ms_ = now_ms();
   auto* slots = static_cast<volatile int32_t*>(counter_view_);
+  // 先发布"这一帧的源尺寸"，再 +1 帧号：观看端看到新帧号时尺寸一定已经就绪。
+  slots[kSrcWidthSlot] = src_width;
+  slots[kSrcHeightSlot] = src_height;
   slots[kFrameIdSlot] = slots[kFrameIdSlot] + 1;
 }
 
@@ -397,6 +410,18 @@ bool test_read_drop_counters_iosurface(
   rate_limited = slots[kRateLimitedDropSlot];
   consumer_absent = slots[kConsumerAbsentDropSlot];
   return true;
+}
+
+bool test_read_frame_size_iosurface(
+    const std::shared_ptr<IOSurfaceVideoSink>& sink, uint32_t& width,
+    uint32_t& height) {
+  if (!sink || sink->counter_view_ == nullptr) {
+    return false;
+  }
+  auto* slots = static_cast<volatile int32_t*>(sink->counter_view_);
+  width = static_cast<uint32_t>(slots[kSrcWidthSlot]);
+  height = static_cast<uint32_t>(slots[kSrcHeightSlot]);
+  return width > 0 && height > 0;
 }
 
 bool test_read_first_pixel(const std::shared_ptr<IOSurfaceVideoSink>& sink,

@@ -59,6 +59,11 @@ pub mod ffi {
             rate_limited: &mut i32,
             consumer_absent: &mut i32,
         ) -> bool;
+        fn test_read_frame_size_iosurface(
+            sink: &SharedPtr<IOSurfaceVideoSink>,
+            width: &mut u32,
+            height: &mut u32,
+        ) -> bool;
         fn test_read_first_pixel(
             sink: &SharedPtr<IOSurfaceVideoSink>,
             first_pixel: &mut u32,
@@ -91,6 +96,11 @@ mod tests {
 
         ffi::test_feed_split_frame_iosurface(&sink, 64, 32);
         assert_eq!(ffi::test_frame_counter_iosurface(&sink), 1, "应该写成一帧");
+
+        // 与 Windows 版同一契约：slot 5/6 = 解码后的真实帧尺寸（C# 靠它发现竖横屏切换）。
+        let (mut src_w, mut src_h) = (0u32, 0u32);
+        assert!(ffi::test_read_frame_size_iosurface(&sink, &mut src_w, &mut src_h));
+        assert_eq!((src_w, src_h), (64, 32), "slot 5/6 应该是解码后的真实帧尺寸");
 
         let mut first_pixel = 0u32;
         assert!(ffi::test_read_first_pixel(&sink, &mut first_pixel));

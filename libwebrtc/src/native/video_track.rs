@@ -40,6 +40,11 @@ impl RtcVideoTrack {
         video_to_media(self.sys_handle.clone())
     }
 
+    /// 请求底层源刷新一帧（远端轨会由 receiver 向发送端发 PLI/FIR 关键帧请求）。
+    pub fn request_refresh_frame(&self) -> u32 {
+        self.sys_handle.request_refresh_frame()
+    }
+
     /// Set the packet trailer handler for this track.
     ///
     /// When set, any `NativeVideoStream` created from this track will

@@ -74,6 +74,7 @@ pub mod ffi {
         fn add_sink(self: &VideoTrack, sink: &SharedPtr<NativeVideoSink>);
         fn remove_sink(self: &VideoTrack, sink: &SharedPtr<NativeVideoSink>);
         fn set_should_receive(self: &VideoTrack, should_receive: bool);
+        fn request_refresh_frame(self: &VideoTrack) -> u32;
         fn should_receive(self: &VideoTrack) -> bool;
         fn content_hint(self: &VideoTrack) -> ContentHint;
         fn set_content_hint(self: &VideoTrack, hint: ContentHint);

@@ -60,7 +60,13 @@ constexpr DWORD kAcquireTimeoutMs = 50;
 //   3 = 消费端不在场丢弃：producer_active=0 或退避期丢掉的帧数
 // 于是 C# 侧可以算出一个"到 sink 的帧数 ≈ 写入 + 限速丢 + 无宿主丢"，
 // 一眼看出"远端推了多少、本端只转了多少"（VDI 上最关心的那笔账）。
-constexpr int kFrameSlotCount = 5;
+//
+// 5/6 = **解码后的真实帧宽高**（每写成一帧更新）。纹理宽高是建流时定死的，
+//       源换方向/换分辨率时原生只能把新画面等比塞进旧纹理（居中留黑），
+//       观看端（GpuTexturePresenter）读这两个槽发现"纹理比例和源比例不符"就重建纹理。
+constexpr int kFrameSlotCount = 7;
+constexpr int kSrcWidthSlot = 5;
+constexpr int kSrcHeightSlot = 6;
 constexpr int kFrameIdSlot = 0;
 constexpr int kProducerActiveSlot = 1;
 constexpr int kRateLimitedDropSlot = 2;
@@ -492,7 +498,11 @@ void D3D11VideoSink::OnFrame(const webrtc::VideoFrame& frame) {
   }
   last_write_ms_ = now_ms();
   if (frame_view_ != nullptr) {
-    InterlockedIncrement(static_cast<volatile LONG*>(frame_view_) + kFrameIdSlot);
+    auto* slots = static_cast<volatile LONG*>(frame_view_);
+    // 先发布"这一帧的源尺寸"，再 +1 帧号：观看端看到新帧号时尺寸一定已经就绪。
+    slots[kSrcWidthSlot] = static_cast<LONG>(src_width);
+    slots[kSrcHeightSlot] = static_cast<LONG>(src_height);
+    InterlockedIncrement(slots + kFrameIdSlot);
   }
 }
 
@@ -652,6 +662,18 @@ bool test_read_drop_counters(const std::shared_ptr<D3D11VideoSink>& sink,
   rate_limited = slots[kRateLimitedDropSlot];
   consumer_absent = slots[kConsumerAbsentDropSlot];
   return true;
+}
+
+bool test_read_frame_size(const std::shared_ptr<D3D11VideoSink>& sink,
+                          uint32_t& width,
+                          uint32_t& height) {
+  if (!sink || sink->frame_view_ == nullptr) {
+    return false;
+  }
+  auto* slots = static_cast<volatile LONG*>(sink->frame_view_);
+  width = static_cast<uint32_t>(slots[kSrcWidthSlot]);
+  height = static_cast<uint32_t>(slots[kSrcHeightSlot]);
+  return width > 0 && height > 0;
 }
 
 uint64_t D3D11VideoSink::shared_handle() const { return shared_handle_; }

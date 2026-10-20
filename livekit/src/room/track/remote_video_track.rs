@@ -133,6 +133,15 @@ impl RemoteVideoTrack {
         true
     }
 
+    /// 请求发送端**立刻**发一帧关键帧（PLI/FIR）。
+    ///
+    /// 场景：订阅端刚入会、或本端共享纹理要重建时，发送端可能正落在两个关键帧之间 ——
+    /// 静态画面（PPT/白板/不动的桌面）下它可能几十秒都不产关键帧，本端解码器一帧都出不来。
+    /// 返回值同 `RtcVideoTrack::request_refresh_frame()`：1 = 已向源请求。
+    pub fn request_key_frame(&self) -> u32 {
+        self.rtc_track().request_refresh_frame()
+    }
+
     /// Returns a clone of the packet trailer handler, if one has been set.
     pub(crate) fn packet_trailer_handler(&self) -> Option<PacketTrailerHandler> {
         self.rtc_track().packet_trailer_handler()

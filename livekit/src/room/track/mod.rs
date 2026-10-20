@@ -141,6 +141,14 @@ impl Track {
         }
     }
 
+    /// 请求远端视频轨立刻发一帧关键帧（PLI/FIR）；本地轨 / 音频轨返回 0。
+    pub fn request_key_frame(&self) -> u32 {
+        match self {
+            Self::RemoteVideo(track) => track.request_key_frame(),
+            _ => 0,
+        }
+    }
+
     /// Returns the codec clock rate from the receiver's RTP parameters.
     /// This is the actual sample rate of the audio delivered by WebRTC's decoder.
     pub fn codec_clock_rate(&self) -> Option<u32> {

@@ -98,6 +98,8 @@ class IOSurfaceVideoSink : public webrtc::VideoSinkInterface<webrtc::VideoFrame>
   friend bool test_read_drop_counters_iosurface(const std::shared_ptr<IOSurfaceVideoSink>& sink,
                                                 int32_t& rate_limited,
                                                 int32_t& consumer_absent);
+  friend bool test_read_frame_size_iosurface(const std::shared_ptr<IOSurfaceVideoSink>& sink,
+                                             uint32_t& width, uint32_t& height);
   friend bool test_read_first_pixel(const std::shared_ptr<IOSurfaceVideoSink>& sink,
                                     uint32_t& first_pixel);
 };
@@ -114,6 +116,10 @@ int32_t test_frame_counter_iosurface(const std::shared_ptr<IOSurfaceVideoSink>& 
 bool test_read_drop_counters_iosurface(const std::shared_ptr<IOSurfaceVideoSink>& sink,
                                        int32_t& rate_limited,
                                        int32_t& consumer_absent);
+
+/// 读计数器里的"解码后真实帧宽高"（slot 5/6）。
+bool test_read_frame_size_iosurface(const std::shared_ptr<IOSurfaceVideoSink>& sink,
+                                    uint32_t& width, uint32_t& height);
 
 /// 读 IOSurface 第 0 行第 0 个像素（BGRA 打包进 uint32，低字节为 B）。
 bool test_read_first_pixel(const std::shared_ptr<IOSurfaceVideoSink>& sink,

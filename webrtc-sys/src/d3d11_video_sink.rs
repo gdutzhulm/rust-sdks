@@ -69,6 +69,11 @@ pub mod ffi {
             rate_limited: &mut i32,
             consumer_absent: &mut i32,
         ) -> bool;
+        fn test_read_frame_size(
+            sink: &SharedPtr<D3D11VideoSink>,
+            width: &mut u32,
+            height: &mut u32,
+        ) -> bool;
     }
 }
 
@@ -99,6 +104,11 @@ mod tests {
 
         ffi::test_feed_split_frame(&sink, 64, 32);
         assert_eq!(ffi::test_frame_counter(&sink), 1, "消费端在场时应写成一帧");
+
+        // 解码后的真实帧尺寸必须随帧发布（C# 靠 slot 5/6 判断"纹理比例 ≠ 源比例"后重建纹理）。
+        let (mut src_w, mut src_h) = (0u32, 0u32);
+        assert!(ffi::test_read_frame_size(&sink, &mut src_w, &mut src_h));
+        assert_eq!((src_w, src_h), (64, 32), "slot 5/6 应该是解码后的真实帧尺寸");
 
         let (mut top, mut bottom) = (0u32, 0u32);
         assert!(ffi::test_read_texture(&sink, &mut top, &mut bottom));
