@@ -16,6 +16,10 @@
 
 #include "livekit/adm_proxy.h"
 
+#include <atomic>
+#include <cstring>
+#include <optional>
+
 #include "api/audio/audio_device.h"
 #include "api/audio/create_audio_device_module.h"
 #include "api/make_ref_counted.h"
@@ -30,9 +34,92 @@
 
 namespace livekit_ffi {
 
+class CountingAudioTransport final : public webrtc::AudioTransport {
+ public:
+  CountingAudioTransport(std::atomic<uint64_t>* playout_samples,
+                         std::atomic<bool>* count_platform_playout)
+      : playout_samples_(playout_samples),
+        count_platform_playout_(count_platform_playout) {}
+
+  void SetSource(webrtc::AudioTransport* source) {
+    source_.store(source, std::memory_order_release);
+  }
+
+  int32_t RecordedDataIsAvailable(const void* audioSamples,
+                                  size_t nSamples,
+                                  size_t nBytesPerSample,
+                                  size_t nChannels,
+                                  uint32_t samplesPerSec,
+                                  uint32_t totalDelayMS,
+                                  int32_t clockDrift,
+                                  uint32_t currentMicLevel,
+                                  bool keyPressed,
+                                  uint32_t& newMicLevel) override {
+    webrtc::AudioTransport* source = source_.load(std::memory_order_acquire);
+    if (source == nullptr) {
+      newMicLevel = 0;
+      return -1;
+    }
+    return source->RecordedDataIsAvailable(
+        audioSamples, nSamples, nBytesPerSample, nChannels, samplesPerSec,
+        totalDelayMS, clockDrift, currentMicLevel, keyPressed, newMicLevel);
+  }
+
+  int32_t NeedMorePlayData(size_t nSamples,
+                           size_t nBytesPerSample,
+                           size_t nChannels,
+                           uint32_t samplesPerSec,
+                           void* audioSamples,
+                           size_t& nSamplesOut,
+                           int64_t* elapsed_time_ms,
+                           int64_t* ntp_time_ms) override {
+    webrtc::AudioTransport* source = source_.load(std::memory_order_acquire);
+    if (source == nullptr) {
+      if (audioSamples != nullptr) {
+        std::memset(audioSamples, 0, nSamples * nBytesPerSample * nChannels);
+      }
+      nSamplesOut = nSamples;
+      return 0;
+    }
+
+    int32_t result = source->NeedMorePlayData(
+        nSamples, nBytesPerSample, nChannels, samplesPerSec, audioSamples,
+        nSamplesOut, elapsed_time_ms, ntp_time_ms);
+    if (result == 0 && nSamplesOut > 0 &&
+        count_platform_playout_->load(std::memory_order_relaxed)) {
+      playout_samples_->fetch_add(static_cast<uint64_t>(nSamplesOut),
+                                  std::memory_order_relaxed);
+    }
+    return result;
+  }
+
+  void PullRenderData(int bits_per_sample,
+                      int sample_rate,
+                      size_t number_of_channels,
+                      size_t number_of_frames,
+                      void* audio_data,
+                      int64_t* elapsed_time_ms,
+                      int64_t* ntp_time_ms) override {
+    webrtc::AudioTransport* source = source_.load(std::memory_order_acquire);
+    if (source != nullptr) {
+      source->PullRenderData(bits_per_sample, sample_rate, number_of_channels,
+                             number_of_frames, audio_data, elapsed_time_ms,
+                             ntp_time_ms);
+    }
+  }
+
+ private:
+  std::atomic<webrtc::AudioTransport*> source_{nullptr};
+  std::atomic<uint64_t>* playout_samples_;
+  std::atomic<bool>* count_platform_playout_;
+};
+
 AdmProxy::AdmProxy(const webrtc::Environment& env, webrtc::Thread* worker_thread)
     : env_(env),
       worker_thread_(worker_thread) {
+  audio_transport_proxy_ = std::make_unique<CountingAudioTransport>(
+      &platform_playout_samples_, &count_platform_playout_);
+
   // Create the synthetic ADM for synthetic mode. SyntheticAudioDevice pumps
   // the WebRTC audio pipeline without platform audio, allowing FFI callbacks
   // to receive decoded remote audio.
@@ -196,6 +283,10 @@ bool AdmProxy::is_platform_adm_active() const {
   return platform_adm_ != nullptr && platform_adm_ref_count_ > 0;
 }
 
+uint64_t AdmProxy::platform_playout_samples() const {
+  return platform_playout_samples_.load(std::memory_order_relaxed);
+}
+
 // =============================================================================
 // Recording/Playout Control
 // =============================================================================
@@ -233,6 +324,8 @@ bool AdmProxy::playout_enabled() const {
 // =============================================================================
 
 void AdmProxy::SwitchPlayoutModeIfNeeded() {
+  count_platform_playout_.store(is_platform_playout_active(),
+                                std::memory_order_relaxed);
   if (!playing_) return;
 
   bool use_platform = is_platform_playout_active();
@@ -289,13 +382,16 @@ int32_t AdmProxy::ActiveAudioLayer(AudioLayer* audioLayer) const {
 int32_t AdmProxy::RegisterAudioCallback(webrtc::AudioTransport* transport) {
   webrtc::MutexLock lock(&mutex_);
   audio_transport_ = transport;
+  audio_transport_proxy_->SetSource(transport);
+  webrtc::AudioTransport* wrapped_transport =
+      transport == nullptr ? nullptr : audio_transport_proxy_.get();
 
-  // Register with both ADMs so they're ready when we switch modes
+  // Register with both ADMs so they're ready when we switch modes.
   if (synthetic_adm_) {
-    synthetic_adm_->RegisterAudioCallback(transport);
+    synthetic_adm_->RegisterAudioCallback(wrapped_transport);
   }
   if (platform_adm_) {
-    platform_adm_->RegisterAudioCallback(transport);
+    platform_adm_->RegisterAudioCallback(wrapped_transport);
   }
   return 0;
 }
@@ -500,6 +596,8 @@ bool AdmProxy::RecordingIsInitialized() const {
 int32_t AdmProxy::StartPlayout() {
   webrtc::MutexLock lock(&mutex_);
   playing_ = true;
+  count_platform_playout_.store(is_platform_playout_active(),
+                                std::memory_order_relaxed);
 
   if (is_platform_playout_active()) {
     if (platform_adm_) {
@@ -518,6 +616,7 @@ int32_t AdmProxy::StartPlayout() {
 int32_t AdmProxy::StopPlayout() {
   webrtc::MutexLock lock(&mutex_);
   playing_ = false;
+  count_platform_playout_.store(false, std::memory_order_relaxed);
 
   // Stop both ADMs
   if (synthetic_adm_) {

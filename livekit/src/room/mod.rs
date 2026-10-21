@@ -37,7 +37,12 @@ use livekit_runtime::JoinHandle;
 use parking_lot::RwLock;
 pub use proto::DisconnectReason;
 use proto::SignalTarget;
-use std::{collections::HashMap, fmt::Debug, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    fmt::Debug,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use thiserror::Error;
 use tokio::sync::{
     broadcast,
@@ -74,6 +79,16 @@ pub mod rpc;
 pub mod track;
 
 pub const SDK_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+const PENDING_MEDIA_TRACK_TTL: Duration = Duration::from_secs(10);
+const MAX_PENDING_MEDIA_TRACKS_PER_PARTICIPANT: usize = 16;
+
+struct PendingMediaTrack {
+    track_id: TrackSid,
+    track: MediaStreamTrack,
+    transceiver: RtpTransceiver,
+    queued_at: Instant,
+}
 
 pub type RoomResult<T> = Result<T, RoomError>;
 
@@ -491,6 +506,9 @@ pub(crate) struct RoomSession {
     active_speakers: RwLock<Vec<Participant>>,
     local_participant: LocalParticipant,
     remote_participants: RwLock<HashMap<ParticipantIdentity, RemoteParticipant>>,
+    /// Media tracks can arrive in the same SDP offer as, or just before, the participant update.
+    /// Keep them briefly keyed by ParticipantSid instead of dropping them permanently.
+    pending_media_tracks: RwLock<HashMap<ParticipantSid, Vec<PendingMediaTrack>>>,
     e2ee_manager: E2eeManager,
     incoming_stream_manager: IncomingStreamManager,
     pub(crate) outgoing_stream_manager: OutgoingStreamManager,
@@ -701,6 +719,7 @@ impl Room {
                 reliable_dc_options: Default::default(),
             }),
             remote_participants: Default::default(),
+            pending_media_tracks: Default::default(),
             active_speakers: Default::default(),
             options: options.clone(),
             rtc_engine: rtc_engine.clone(),
@@ -1209,6 +1228,10 @@ impl RoomSession {
                 remote_participant.update_info(pi.clone()); // Add tracks
             }
         }
+        // A media track may have arrived before this participant update. Bind it now that the
+        // participant and its publication metadata are available.
+        self.bind_pending_media_tracks();
+
         if !participants.is_empty() {
             self.dispatcher.dispatch(&RoomEvent::ParticipantsUpdated { participants });
         }
@@ -1290,9 +1313,79 @@ impl RoomSession {
                 remote_participant.add_subscribed_media_track(track_id, track, transceiver).await;
             });
         } else {
-            // The server should send participant updates before sending a new offer, this should
-            // happen
-            log::error!("received track from an unknown participant: {:?}", participant_sid);
+            // Participant updates and SDP/media events are not guaranteed to be delivered in
+            // lockstep by every SFU/network path. Buffer briefly and bind after the participant
+            // update arrives instead of dropping the media track forever.
+            log::warn!(
+                "received track before participant metadata; buffering: participant={:?}, track={:?}",
+                participant_sid,
+                track_id
+            );
+            self.queue_pending_media_track(participant_sid, track_id, track, transceiver);
+        }
+    }
+
+    fn queue_pending_media_track(
+        &self,
+        participant_sid: ParticipantSid,
+        track_id: TrackSid,
+        track: MediaStreamTrack,
+        transceiver: RtpTransceiver,
+    ) {
+        let now = Instant::now();
+        let mut pending = self.pending_media_tracks.write();
+
+        pending.retain(|_, tracks| {
+            tracks.retain(|item| now.duration_since(item.queued_at) <= PENDING_MEDIA_TRACK_TTL);
+            !tracks.is_empty()
+        });
+
+        let tracks = pending.entry(participant_sid).or_default();
+        tracks.retain(|item| item.track_id != track_id);
+        if tracks.len() >= MAX_PENDING_MEDIA_TRACKS_PER_PARTICIPANT {
+            tracks.remove(0);
+        }
+        tracks.push(PendingMediaTrack { track_id, track, transceiver, queued_at: now });
+    }
+
+    fn bind_pending_media_tracks(&self) {
+        let now = Instant::now();
+        let participants = self.remote_participants.read().clone();
+        let mut ready = Vec::new();
+
+        {
+            let mut pending = self.pending_media_tracks.write();
+            pending.retain(|participant_sid, tracks| {
+                tracks.retain(|item| now.duration_since(item.queued_at) <= PENDING_MEDIA_TRACK_TTL);
+                if tracks.is_empty() {
+                    return false;
+                }
+
+                let participant = participants
+                    .values()
+                    .find(|participant| participant.sid().as_str() == participant_sid.as_str())
+                    .cloned();
+                if let Some(participant) = participant {
+                    for item in tracks.drain(..) {
+                        ready.push((participant.clone(), item));
+                    }
+                    return false;
+                }
+                true
+            });
+        }
+
+        for (participant, item) in ready {
+            log::info!(
+                "binding buffered remote track: participant={}, track={}",
+                participant.identity(),
+                item.track_id
+            );
+            livekit_runtime::spawn(async move {
+                participant
+                    .add_subscribed_media_track(item.track_id, item.track, item.transceiver)
+                    .await;
+            });
         }
     }
 
@@ -2143,6 +2236,7 @@ impl RoomSession {
 
         let mut participants = self.remote_participants.write();
         participants.remove(&remote_participant.identity());
+        self.pending_media_tracks.write().remove(&remote_participant.sid());
         self.dispatcher.dispatch(&RoomEvent::ParticipantDisconnected(remote_participant));
     }
 

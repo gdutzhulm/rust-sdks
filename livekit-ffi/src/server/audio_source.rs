@@ -92,9 +92,9 @@ impl FfiAudioSource {
                                 e
                             );
                         }
-                        // 注意：**不要**在这里顺手 stop → 应用 → start —— 实测启用硬件 AEC 后
-                        // start_recording 会失败（采集静默），而软件参数边跑边应用是安全的。
-
+                        // 这里必须发生在 StartRecording 之前：Windows ADM 的
+                        // EnableBuiltInAEC/AGC/NS 在录音初始化后调用必然失败。C# 侧现已先建源、
+                        // 应用参数，再启动采集；dll 侧另有一道 recording_initialized 护栏。
                     }
                 }
 

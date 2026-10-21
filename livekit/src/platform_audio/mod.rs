@@ -1107,36 +1107,48 @@ impl PlatformAudio {
         // 【本地定制 fork】记录"请求了硬件、但开关失败"的情况：下面会整体回退到软件再配一次。
         let mut hardware_enable_failed = false;
 
-        // Enable/disable hardware AEC
-        // Note: When hardware is disabled, WebRTC automatically falls back to software
-        if runtime.builtin_aec_is_available() {
-            let enable_hw = use_hardware && options.echo_cancellation;
-            if !runtime.enable_builtin_aec(enable_hw) {
-                log::warn!("enable_builtin_aec({}) failed", enable_hw);
-                if enable_hw {
-                    hardware_enable_failed = true;
+        // Windows ADM 的 EnableBuiltInAEC/AGC/NS 只允许在 InitRecording 之前调用；
+        // 录音初始化后再调用必然返回 -1。调用方（FFI 的 PlatformAudioSource 建源）
+        // 必须把处理参数应用放在 StartRecording 之前。这里再做一道防误用护栏：
+        // 已经初始化时不再切换硬件效果，避免刷 WARN 或误以为参数已生效。
+        let hardware_toggle_applied = !runtime.recording_is_initialized();
+        if !hardware_toggle_applied {
+            log::info!(
+                "audio processing: recording already initialized; hardware effect toggles skipped (prefer_hw={})",
+                use_hardware
+            );
+        } else {
+            // Enable/disable hardware AEC
+            // Note: When hardware is disabled, WebRTC automatically falls back to software
+            if runtime.builtin_aec_is_available() {
+                let enable_hw = use_hardware && options.echo_cancellation;
+                if !runtime.enable_builtin_aec(enable_hw) {
+                    log::warn!("enable_builtin_aec({}) failed", enable_hw);
+                    if enable_hw {
+                        hardware_enable_failed = true;
+                    }
                 }
             }
-        }
 
-        // Enable/disable hardware AGC
-        if runtime.builtin_agc_is_available() {
-            let enable_hw = use_hardware && options.auto_gain_control;
-            if !runtime.enable_builtin_agc(enable_hw) {
-                log::warn!("enable_builtin_agc({}) failed", enable_hw);
-                if enable_hw {
-                    hardware_enable_failed = true;
+            // Enable/disable hardware AGC
+            if runtime.builtin_agc_is_available() {
+                let enable_hw = use_hardware && options.auto_gain_control;
+                if !runtime.enable_builtin_agc(enable_hw) {
+                    log::warn!("enable_builtin_agc({}) failed", enable_hw);
+                    if enable_hw {
+                        hardware_enable_failed = true;
+                    }
                 }
             }
-        }
 
-        // Enable/disable hardware NS
-        if runtime.builtin_ns_is_available() {
-            let enable_hw = use_hardware && options.noise_suppression;
-            if !runtime.enable_builtin_ns(enable_hw) {
-                log::warn!("enable_builtin_ns({}) failed", enable_hw);
-                if enable_hw {
-                    hardware_enable_failed = true;
+            // Enable/disable hardware NS
+            if runtime.builtin_ns_is_available() {
+                let enable_hw = use_hardware && options.noise_suppression;
+                if !runtime.enable_builtin_ns(enable_hw) {
+                    log::warn!("enable_builtin_ns({}) failed", enable_hw);
+                    if enable_hw {
+                        hardware_enable_failed = true;
+                    }
                 }
             }
         }
@@ -1154,13 +1166,13 @@ falling back to software AEC3/NS/AGC"
             });
         }
 
-
         log::info!(
-            "Audio processing configured: AEC={}, AGC={}, NS={}, prefer_hw={}",
+            "Audio processing configured: AEC={}, AGC={}, NS={}, prefer_hw={}, hardware_toggle={}",
             options.echo_cancellation,
             options.auto_gain_control,
             options.noise_suppression,
-            options.prefer_hardware_processing
+            options.prefer_hardware_processing,
+            if hardware_toggle_applied { "applied" } else { "deferred(recording_initialized)" }
         );
 
         Ok(())

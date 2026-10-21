@@ -205,4 +205,8 @@ bool AudioDeviceController::is_platform_adm_active() const {
   return adm_proxy_->is_platform_adm_active();
 }
 
+uint64_t AudioDeviceController::platform_playout_samples() const {
+  return adm_proxy_->platform_playout_samples();
+}
+
 }  // namespace livekit_ffi

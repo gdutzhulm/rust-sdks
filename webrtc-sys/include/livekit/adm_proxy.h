@@ -16,6 +16,9 @@
 
 #pragma once
 
+#include <atomic>
+#include <cstdint>
+#include <memory>
 #include <string>
 
 #include "api/environment/environment.h"
@@ -30,6 +33,8 @@ class Thread;
 }  // namespace webrtc
 
 namespace livekit_ffi {
+
+class CountingAudioTransport;
 
 /// ADM Proxy that manages synthetic and platform audio modes.
 ///
@@ -92,6 +97,10 @@ class AdmProxy : public webrtc::AudioDeviceModule {
 
   /// Returns true if Platform ADM is currently active (ref_count > 0).
   bool is_platform_adm_active() const;
+
+  /// Actual audio samples pulled by the active ADM through its playback callback.
+  /// This is a monotonic counter used to detect "RTP is received but speakers stalled".
+  uint64_t platform_playout_samples() const;
 
   // ===========================================================================
   // Recording/Playout Control
@@ -252,6 +261,12 @@ class AdmProxy : public webrtc::AudioDeviceModule {
 
   // Audio transport callback (registered by WebRTC)
   webrtc::AudioTransport* audio_transport_ = nullptr;
+
+  // Wraps the WebRTC transport so ADM playout callbacks can be observed without
+  // changing the WebRTC audio path. Counts actual samples requested by speakers.
+  std::unique_ptr<CountingAudioTransport> audio_transport_proxy_;
+  std::atomic<uint64_t> platform_playout_samples_{0};
+  std::atomic<bool> count_platform_playout_{false};
 
   // State tracking
   bool playout_initialized_ = false;

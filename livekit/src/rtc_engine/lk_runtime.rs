@@ -275,6 +275,12 @@ impl LkRuntime {
     pub(crate) fn is_platform_adm_active(&self) -> bool {
         self.pc_factory.is_platform_adm_active()
     }
+
+    /// Monotonic count of audio samples actually pulled by the active ADM for playback.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn platform_playout_samples(&self) -> u64 {
+        self.pc_factory.platform_playout_samples()
+    }
 }
 
 impl Drop for LkRuntime {

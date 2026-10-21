@@ -24,7 +24,10 @@ use std::{
 };
 
 use bytes::Bytes;
-use libwebrtc::{prelude::*, stats::RtcStats};
+use libwebrtc::{
+    prelude::*,
+    stats::{dictionaries, MediaPlayoutStats, RtcStats},
+};
 use livekit_api::signal_client::{SignalClient, SignalEvent, SignalEvents};
 use livekit_datatrack::backend as dt;
 use livekit_protocol::{self as proto};
@@ -820,14 +823,43 @@ impl RtcSession {
     }
 
     pub async fn get_stats(&self) -> EngineResult<SessionStats> {
-        let publisher_stats = self.inner.publisher_pc.peer_connection().get_stats().await?;
+        let mut publisher_stats = self.inner.publisher_pc.peer_connection().get_stats().await?;
 
-        let subscriber_stats = if let Some(ref sub_pc) = self.inner.subscriber_pc {
+        let mut subscriber_stats = if let Some(ref sub_pc) = self.inner.subscriber_pc {
             sub_pc.peer_connection().get_stats().await?
         } else {
             // In single PC mode, there's no separate subscriber stats
             Vec::new()
         };
+
+        // WebRTC's built-in audio-playout stats only cover its own audio sink. When remote audio
+        // is rendered directly by the platform ADM, TotalSamplesCount stays 0 even though the
+        // speakers are working. Publish a synthetic MediaPlayout entry backed by the ADM's real
+        // NeedMorePlayData callback so the application can distinguish "received" from "played".
+        let playout_samples = LkRuntime::instance().platform_playout_samples();
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as i64)
+            .unwrap_or_default();
+        let platform_playout = RtcStats::MediaPlayout(MediaPlayoutStats {
+            rtc: dictionaries::RtcStats {
+                id: "platform-adm-playout".to_string(),
+                timestamp,
+            },
+            audio_playout: dictionaries::AudioPlayoutStats {
+                kind: "audio".to_string(),
+                total_samples_count: playout_samples,
+                ..Default::default()
+            },
+        });
+
+        // Playout belongs to the subscriber transport when dual-PC mode is active; in single-PC
+        // mode it is still exposed through the publisher stats list.
+        if self.inner.subscriber_pc.is_some() {
+            subscriber_stats.push(platform_playout);
+        } else {
+            publisher_stats.push(platform_playout);
+        }
 
         Ok(SessionStats { publisher_stats, subscriber_stats })
     }

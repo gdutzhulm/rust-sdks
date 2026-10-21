@@ -156,6 +156,7 @@ pub mod native {
         fn release_platform_adm(&self);
         fn platform_adm_ref_count(&self) -> i32;
         fn is_platform_adm_active(&self) -> bool;
+        fn platform_playout_samples(&self) -> u64;
     }
 
     impl PeerConnectionFactoryExt for PeerConnectionFactory {
@@ -297,6 +298,10 @@ pub mod native {
 
         fn is_platform_adm_active(&self) -> bool {
             self.handle.is_platform_adm_active()
+        }
+
+        fn platform_playout_samples(&self) -> u64 {
+            self.handle.platform_playout_samples()
         }
     }
 }

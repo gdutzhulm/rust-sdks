@@ -316,6 +316,11 @@ impl PeerConnectionFactory {
     pub fn is_platform_adm_active(&self) -> bool {
         self.sys_handle.audio_device().is_platform_adm_active()
     }
+
+    /// Monotonic count of audio samples actually pulled by the active ADM for playback.
+    pub fn platform_playout_samples(&self) -> u64 {
+        self.sys_handle.audio_device().platform_playout_samples()
+    }
 }
 
 #[cfg(test)]

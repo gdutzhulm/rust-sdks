@@ -66,6 +66,7 @@ pub mod ffi {
         fn release_platform_adm(self: &AudioDeviceController);
         fn platform_adm_ref_count(self: &AudioDeviceController) -> i32;
         fn is_platform_adm_active(self: &AudioDeviceController) -> bool;
+        fn platform_playout_samples(self: &AudioDeviceController) -> u64;
     }
 }
 
