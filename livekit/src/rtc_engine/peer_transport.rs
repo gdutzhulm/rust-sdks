@@ -34,6 +34,7 @@ struct TransportInner {
     // Publish-side target bitrate (bps) for offer munging
     max_send_bitrate_bps: Option<u64>,
     pending_initial_offer: Option<SessionDescription>,
+    last_diag_offer_sdp: Option<String>,
 }
 
 pub struct PeerTransport {
@@ -66,6 +67,7 @@ impl PeerTransport {
                 single_pc_mode,
                 max_send_bitrate_bps: None,
                 pending_initial_offer: None,
+                last_diag_offer_sdp: None,
             })),
         }
     }
@@ -196,6 +198,15 @@ impl PeerTransport {
         }
 
         let mut inner = self.inner.lock().await;
+        if super::native_diag_enabled() {
+            let diag_summary = sdp_diag_sections(&offer.to_string()).join(" | ");
+            log::info!(
+                "[SDP-DIAG] sending_initial_offer single_pc={} sections={}",
+                inner.single_pc_mode,
+                diag_summary
+            );
+            inner.last_diag_offer_sdp = Some(diag_summary);
+        }
         inner.pending_initial_offer = Some(offer.clone());
         Ok(Some(offer))
     }
@@ -536,6 +547,19 @@ impl PeerTransport {
             }
         }
 
+        // 诊断默认关闭；只有 LK_NATIVE_DIAG=1 时才构造 m-line 摘要字符串。
+        if super::native_diag_enabled() {
+            let diag_summary = sdp_diag_sections(&offer.to_string()).join(" | ");
+            if inner.last_diag_offer_sdp.as_deref() != Some(diag_summary.as_str()) {
+                log::info!(
+                    "[SDP-DIAG] sending_offer single_pc={} sections={}",
+                    inner.single_pc_mode,
+                    diag_summary
+                );
+                inner.last_diag_offer_sdp = Some(diag_summary);
+            }
+        }
+
         self.peer_connection.set_local_description(offer.clone()).await?;
 
         if let Some(handler) = self.on_offer_handler.lock().as_mut() {
@@ -546,9 +570,83 @@ impl PeerTransport {
     }
 }
 
+#[derive(Default)]
+struct SdpMLineDiag {
+    kind: String,
+    mid: String,
+    direction: String,
+    msid: String,
+    ssrcs: Vec<String>,
+}
+
+impl SdpMLineDiag {
+    fn as_log(&self) -> String {
+        format!(
+            "{}:mid={}:dir={}:msid={}:ssrcs=[{}]",
+            if self.kind.is_empty() { "?" } else { &self.kind },
+            if self.mid.is_empty() { "?" } else { &self.mid },
+            if self.direction.is_empty() { "?" } else { &self.direction },
+            if self.msid.is_empty() { "-" } else { &self.msid },
+            self.ssrcs.join(",")
+        )
+    }
+}
+
+/// 输出 SDP 每个 m-line 的关键协商信息，不打印整份 SDP，避免日志膨胀和敏感信息泄漏。
+pub(super) fn sdp_diag_sections(sdp: &str) -> Vec<String> {
+    let mut summaries = Vec::new();
+    let mut current: Option<SdpMLineDiag> = None;
+
+    for raw_line in sdp.lines() {
+        let line = raw_line.trim_end_matches('\r');
+        if let Some(m_line) = line.strip_prefix("m=") {
+            if let Some(section) = current.take() {
+                summaries.push(section.as_log());
+            }
+            current = Some(SdpMLineDiag {
+                kind: m_line.split_whitespace().next().unwrap_or("?").to_string(),
+                ..Default::default()
+            });
+            continue;
+        }
+
+        let Some(section) = current.as_mut() else {
+            continue;
+        };
+        if let Some(mid) = line.strip_prefix("a=mid:") {
+            section.mid = mid.to_string();
+        } else if let Some(msid) = line.strip_prefix("a=msid:") {
+            section.msid = msid.to_string();
+        } else if let Some(ssrc) = line.strip_prefix("a=ssrc:") {
+            let ssrc = ssrc.split_whitespace().next().unwrap_or_default();
+            if !ssrc.is_empty() && !section.ssrcs.iter().any(|known| known == ssrc) {
+                section.ssrcs.push(ssrc.to_string());
+            }
+        } else if let Some(direction) = line.strip_prefix("a=") {
+            if matches!(direction, "sendrecv" | "sendonly" | "recvonly" | "inactive") {
+                section.direction = direction.to_string();
+            }
+        }
+    }
+
+    if let Some(section) = current {
+        summaries.push(section.as_log());
+    }
+    summaries
+}
+
 #[cfg(test)]
 mod tests {
-    use super::PeerTransport;
+    use super::{sdp_diag_sections, PeerTransport};
+
+    #[test]
+    fn sdp_diag_reports_mid_direction_msid_and_ssrc() {
+        let sdp = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:7\r\na=sendonly\r\na=msid:stream-a track-a\r\na=ssrc:1234 cname:x\r\na=ssrc:1234 msid:stream-a track-a\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:8\r\na=recvonly\r\n";
+        let sections = sdp_diag_sections(sdp);
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[0], "audio:mid=7:dir=sendonly:msid=stream-a track-a:ssrcs=[1234]");
+        assert_eq!(sections[1], "video:mid=8:dir=recvonly:msid=-:ssrcs=[]");
+    }
 
     #[test]
     fn no_video_codec_is_noop() {

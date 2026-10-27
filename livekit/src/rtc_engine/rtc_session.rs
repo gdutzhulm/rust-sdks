@@ -1321,6 +1321,19 @@ impl SessionInner {
                 self.max_message_size.store(max_message_size, Ordering::Release);
                 log::debug!("negotiated data channel max message size: {} bytes", max_message_size);
 
+                // 诊断默认关闭；只有 LK_NATIVE_DIAG=1 时才构造 SDP 摘要。
+                if super::native_diag_enabled() {
+                    let sections =
+                        super::peer_transport::sdp_diag_sections(&answer.sdp).join(" | ");
+                    let mut mid_to_track_id: Vec<_> = answer.mid_to_track_id.iter().collect();
+                    mid_to_track_id.sort_by_key(|(mid, _)| mid.as_str());
+                    log::info!(
+                        "[SDP-DIAG] received_answer sections={} mid_to_track_id={:?}",
+                        sections,
+                        mid_to_track_id
+                    );
+                }
+
                 let answer =
                     SessionDescription::parse(&answer.sdp, answer.r#type.parse().unwrap()).unwrap(); // Unwrap is ok, the server shouldn't give us an invalid sdp
                 self.publisher_pc.set_remote_description(answer).await?;
@@ -1346,6 +1359,12 @@ impl SessionInner {
 
                 // Dual PC mode: handle offer on subscriber PC
                 log::debug!("received subscriber offer: {:?}", offer);
+                if super::native_diag_enabled() {
+                    log::info!(
+                        "[SDP-DIAG] received_subscriber_offer sections={}",
+                        super::peer_transport::sdp_diag_sections(&offer.sdp).join(" | ")
+                    );
+                }
                 let offer_sdp =
                     SessionDescription::parse(&offer.sdp, offer.r#type.parse().unwrap()).unwrap();
 
@@ -1356,10 +1375,17 @@ impl SessionInner {
                     .create_anwser(offer_sdp, AnswerOptions::default())
                     .await?;
 
+                let answer_sdp = answer.to_string();
+                if super::native_diag_enabled() {
+                    log::info!(
+                        "[SDP-DIAG] sending_subscriber_answer sections={}",
+                        super::peer_transport::sdp_diag_sections(&answer_sdp).join(" | ")
+                    );
+                }
                 self.signal_client
                     .send(proto::signal_request::Message::Answer(proto::SessionDescription {
                         r#type: "answer".to_string(),
-                        sdp: answer.to_string(),
+                        sdp: answer_sdp,
                         id: 0,
                         mid_to_track_id: Default::default(),
                     }))

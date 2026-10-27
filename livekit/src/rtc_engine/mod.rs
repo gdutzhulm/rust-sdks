@@ -18,7 +18,7 @@ use livekit_datatrack::backend as dt;
 use livekit_protocol as proto;
 use livekit_runtime::JoinHandle;
 use parking_lot::{RwLock, RwLockReadGuard};
-use std::{borrow::Cow, fmt::Debug, sync::Arc, time::Duration};
+use std::{borrow::Cow, fmt::Debug, sync::{Arc, OnceLock}, time::Duration};
 use thiserror::Error;
 use tokio::sync::{
     mpsc, oneshot, Notify, RwLock as AsyncRwLock, RwLockReadGuard as AsyncRwLockReadGuard,
@@ -66,6 +66,17 @@ pub(crate) type EngineResult<T> = Result<T, EngineError>;
 /// Only applied to the resume path. Full reconnect builds brand-new PCs which
 /// don't suffer from the "looks-Connected-but-isn't" race.
 pub const PC_RECONNECT_SETTLE_DELAY: Duration = Duration::from_secs(1);
+
+/// 原生诊断默认关闭，避免生产 VDI 上为每路轨道拼 SDP/统计字符串。
+/// 复现现场问题时设置 `LK_NATIVE_DIAG=1`，即可打开 `[SDP-DIAG]` / `[PC-DIAG]`。
+pub(crate) fn native_diag_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("LK_NATIVE_DIAG")
+            .and_then(|v| v.into_string().ok())
+            .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+    })
+}
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum SimulateScenario {

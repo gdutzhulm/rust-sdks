@@ -26,6 +26,11 @@
 #include "rtc_base/logging.h"
 #include "rtc_base/thread.h"
 
+#if defined(_WIN32)
+#include <avrt.h>
+#include <windows.h>
+#endif
+
 #if defined(__ANDROID__)
 #include <jni.h>
 #include "sdk/android/native_api/audio_device_module/audio_device_android.h"
@@ -33,6 +38,69 @@
 #endif
 
 namespace livekit_ffi {
+
+namespace {
+#if defined(_WIN32)
+class MmcssAudioThread {
+ public:
+  explicit MmcssAudioThread(const char* role) : role_(role) {
+    DWORD task_index = 0;
+    SetLastError(ERROR_SUCCESS);
+    task_handle_ = AvSetMmThreadCharacteristicsA("Audio", &task_index);
+    DWORD register_error = GetLastError();
+
+    if (task_handle_ == nullptr) {
+      // WebRTC 的 Windows Core Audio ADM 通常已经替同一线程注册过 MMCSS。
+      // 此时 Windows 返回 ERROR_THREAD_ALREADY_IN_TASK；不是故障，也不能再次设置。
+      if (register_error == ERROR_THREAD_ALREADY_IN_TASK) {
+        RTC_LOG(LS_INFO) << "[ADM-MMCSS] already_registered role=" << role_
+                         << " tid=" << GetCurrentThreadId()
+                         << " priority=" << GetThreadPriority(GetCurrentThread());
+      } else {
+        RTC_LOG(LS_WARNING) << "[ADM-MMCSS] register_failed role=" << role_
+                            << " tid=" << GetCurrentThreadId()
+                            << " win32=" << register_error;
+      }
+      return;
+    }
+
+    BOOL priority_ok = AvSetMmThreadPriority(task_handle_, AVRT_PRIORITY_HIGH);
+    DWORD priority_error = priority_ok ? ERROR_SUCCESS : GetLastError();
+    RTC_LOG(LS_INFO) << "[ADM-MMCSS] registered role=" << role_
+                     << " tid=" << GetCurrentThreadId()
+                     << " task=Audio task_index=" << task_index
+                     << " priority=" << GetThreadPriority(GetCurrentThread())
+                     << " set_priority_ok=" << priority_ok
+                     << " win32=" << priority_error;
+  }
+
+  ~MmcssAudioThread() {
+    if (task_handle_ != nullptr) {
+      AvRevertMmThreadCharacteristics(task_handle_);
+    }
+  }
+
+ private:
+  const char* role_;
+  HANDLE task_handle_ = nullptr;
+};
+#endif
+
+void LogAudioCallbackThreadOnce(const char* role) {
+  thread_local bool logged = false;
+  if (logged) return;
+  logged = true;
+
+#if defined(_WIN32)
+  // 在真正执行 NeedMorePlayData/RecordedDataIsAvailable 的线程上注册 MMCSS。
+  // thread_local 析构时会 AvRevertMmThreadCharacteristics。
+  thread_local MmcssAudioThread mmcss(role);
+  (void)mmcss;
+#else
+  RTC_LOG(LS_INFO) << "[ADM-DIAG] " << role << " callback thread";
+#endif
+}
+}  // namespace
 
 class CountingAudioTransport final : public webrtc::AudioTransport {
  public:
@@ -55,6 +123,7 @@ class CountingAudioTransport final : public webrtc::AudioTransport {
                                   uint32_t currentMicLevel,
                                   bool keyPressed,
                                   uint32_t& newMicLevel) override {
+    LogAudioCallbackThreadOnce("capture");
     webrtc::AudioTransport* source = source_.load(std::memory_order_acquire);
     if (source == nullptr) {
       newMicLevel = 0;
@@ -73,6 +142,7 @@ class CountingAudioTransport final : public webrtc::AudioTransport {
                            size_t& nSamplesOut,
                            int64_t* elapsed_time_ms,
                            int64_t* ntp_time_ms) override {
+    LogAudioCallbackThreadOnce("playout");
     webrtc::AudioTransport* source = source_.load(std::memory_order_acquire);
     if (source == nullptr) {
       if (audioSamples != nullptr) {

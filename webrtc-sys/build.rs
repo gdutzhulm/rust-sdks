@@ -168,6 +168,8 @@ fn main() {
             println!("cargo:rustc-link-lib=dylib=dxgi");
             println!("cargo:rustc-link-lib=dylib=dwmapi");
             println!("cargo:rustc-link-lib=dylib=shcore");
+            // MMCSS: AvSetMmThreadCharacteristics / AvSetMmThreadPriority.
+            println!("cargo:rustc-link-lib=dylib=avrt");
 
             //let path = env::current_dir().unwrap();
             //println!("cargo:rustc-link-search=native={}/vaapi-windows/x64/lib", path.display());

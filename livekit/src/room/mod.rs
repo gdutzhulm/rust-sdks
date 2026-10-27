@@ -1487,13 +1487,38 @@ impl RoomSession {
         };
 
         let mut track_sids = Vec::new();
+        let mut enhanced_desired = 0usize;
+        let mut enhanced_overrides = 0usize;
+        let mut override_samples = Vec::new();
         for (_, participant) in self.remote_participants.read().clone() {
             for (track_sid, track) in participant.track_publications() {
-                if track.is_desired() != auto_subscribe {
+                let name = track.name();
+                let is_enhanced = name.starts_with("enhanced_");
+                let desired = track.is_desired();
+                if is_enhanced && desired {
+                    enhanced_desired += 1;
+                }
+                if desired != auto_subscribe {
                     track_sids.push(track_sid.to_string());
+                    if is_enhanced {
+                        enhanced_overrides += 1;
+                    }
+                    if override_samples.len() < 16 {
+                        override_samples.push(format!("{}:{}", track_sid, name));
+                    }
                 }
             }
         }
+
+        log::info!(
+            "[订阅恢复] Resume SyncState：auto_subscribe={} subscription.subscribe={} explicit_overrides={} enhanced_desired={} enhanced_overrides={} samples={:?}",
+            auto_subscribe,
+            !auto_subscribe,
+            track_sids.len(),
+            enhanced_desired,
+            enhanced_overrides,
+            override_samples,
+        );
 
         let mut dcs = Vec::with_capacity(4);
         if session.has_published() {
@@ -1668,8 +1693,84 @@ impl RoomSession {
                 // Always send the sync state before continuing the reconnection (e.g: publisher
                 // offer)
                 let _ = tx.send(());
+
+                // Server-side SubscriptionManager persists the `desired` flag across a short
+                // Resume. Re-sending subscribe=true for an already-desired enhanced track is a
+                // no-op, so only audit media-level recovery here and report if it never arrives.
+                session.audit_enhanced_subscriptions_after_resume().await;
             }
         });
+    }
+
+    /// Resume 后只做诊断审计，不主动改订阅状态。
+    ///
+    /// 服务端 `SubscriptionManager` 会在短 Resume 期间保留 `desired`；客户端 `SyncState`
+    /// 在 auto-subscribe=true 时也只上报显式退订的轨道。因此对 desired=true 的 enhanced 轨
+    /// 再次发送 subscribe=true 是 no-op，不能修复 media 层未恢复的问题。
+    ///
+    /// 这里在宽限期内观察真正的 `is_subscribed()` 是否恢复，用来区分：
+    /// - desired/订阅状态正常，但 media track 迟到；
+    /// - desired=true 却一直拿不到 media track，需要继续查 transport/reconcile。
+    async fn audit_enhanced_subscriptions_after_resume(self: &Arc<Self>) {
+        for (attempt, delay) in [
+            (1usize, Duration::from_millis(1500)),
+            (2usize, Duration::from_secs(2)),
+            (3usize, Duration::from_secs(5)),
+            (4usize, Duration::from_secs(2)),
+        ] {
+            livekit_runtime::sleep(delay).await;
+
+            let mut desired_enhanced = 0usize;
+            let mut active_enhanced = 0usize;
+            let mut missing_labels = Vec::new();
+
+            for participant in self.remote_participants.read().values() {
+                for publication in participant.track_publications().into_values() {
+                    if !publication.name().starts_with("enhanced_") || !publication.is_desired() {
+                        continue;
+                    }
+
+                    desired_enhanced += 1;
+                    if publication.is_subscribed() {
+                        active_enhanced += 1;
+                    } else {
+                        let track_sid: String = publication.sid().into();
+                        missing_labels.push(format!("{}:{}", participant.identity(), track_sid));
+                    }
+                }
+            }
+
+            let missing = missing_labels.len();
+            log::info!(
+                "[订阅恢复] 重连后第 {} 次审计：desired_enhanced={} active_enhanced={} missing={} labels={:?}",
+                attempt,
+                desired_enhanced,
+                active_enhanced,
+                missing,
+                missing_labels,
+            );
+
+            if missing == 0 {
+                if attempt == 1 {
+                    if desired_enhanced == 0 {
+                        log::info!("[订阅恢复] 当前没有 enhanced 音频轨，无需审计");
+                    } else {
+                        log::info!("[订阅恢复] enhanced 音频轨订阅完整");
+                    }
+                } else if attempt == 4 {
+                    log::info!("[订阅恢复] 宽限期结束，enhanced 音频轨已全部恢复");
+                }
+                return;
+            }
+
+            if attempt == 4 {
+                log::warn!(
+                    "[订阅恢复] 宽限期结束仍有 {} 条 desired=true 的 enhanced 音频轨未恢复：{}；desired 状态本身未丢失，下一步应查 media transport/reconcile 与 TrackSubscribed 事件",
+                    missing,
+                    missing_labels.join(",")
+                );
+            }
+        }
     }
 
     fn handle_restarting(self: &Arc<Self>, tx: oneshot::Sender<()>) {

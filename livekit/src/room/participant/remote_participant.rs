@@ -20,6 +20,7 @@ use std::{
 };
 
 use libwebrtc::prelude::*;
+use libwebrtc::stats::RtcStats;
 use livekit_protocol as proto;
 use livekit_runtime::timeout;
 use parking_lot::Mutex;
@@ -158,6 +159,71 @@ impl RemoteParticipant {
                     }
                 }
             };
+
+            // PC 侧诊断默认关闭；只有 LK_NATIVE_DIAG=1 时才记录 receiver 和延迟统计。
+            if crate::rtc_engine::native_diag_enabled() {
+                let receiver = transceiver.receiver();
+                log::info!(
+                    "[PC-DIAG] subscribed participant={} track={} kind={:?} mid={:?} dir={:?} cur={:?} recv_track={} recv_streams={:?}",
+                    self.identity(),
+                    remote_publication.sid(),
+                    remote_publication.kind(),
+                    transceiver.mid(),
+                    transceiver.direction(),
+                    transceiver.current_direction(),
+                    receiver.track().is_some(),
+                    receiver.stream_ids(),
+                );
+
+                let diag_identity = self.identity().to_string();
+                let diag_track = remote_publication.sid().to_string();
+                livekit_runtime::spawn(async move {
+                    let mut elapsed_secs = 0u64;
+                    for wait_secs in [3u64, 7u64] {
+                        livekit_runtime::sleep(Duration::from_secs(wait_secs)).await;
+                        elapsed_secs += wait_secs;
+                        match receiver.get_stats().await {
+                            Ok(stats) => {
+                                let mut entries = 0usize;
+                                let mut detail = String::new();
+                                for s in &stats {
+                                    if let RtcStats::InboundRtp(inbound) = s {
+                                        entries += 1;
+                                        if entries <= 8 {
+                                            detail.push_str(&format!(
+                                                "{{mid={:?},track={:?},ssrc={},bytes={},level={:.4},last_pkt={:.0}}} ",
+                                                inbound.inbound.mid,
+                                                inbound.inbound.track_identifier,
+                                                inbound.stream.ssrc,
+                                                inbound.inbound.bytes_received,
+                                                inbound.inbound.audio_level,
+                                                inbound.inbound.last_packet_received_timestamp,
+                                            ));
+                                        }
+                                    }
+                                }
+                                log::info!(
+                                    "[PC-DIAG] stats+{}s participant={} track={} recv_track={} inbound_entries={} {}",
+                                    elapsed_secs,
+                                    diag_identity,
+                                    diag_track,
+                                    receiver.track().is_some(),
+                                    entries,
+                                    detail
+                                );
+                            }
+                            Err(e) => log::warn!(
+                                "[PC-DIAG] stats+{}s failed participant={} track={} recv_track={} err={:?}",
+                                elapsed_secs,
+                                diag_identity,
+                                diag_track,
+                                receiver.track().is_some(),
+                                e
+                            ),
+                        }
+                    }
+                });
+            }
 
             track.set_transceiver(Some(transceiver));
 
