@@ -20,7 +20,7 @@ name: Custom native builds (D3D11 + IOSurface)
 
 on:
   push:
-    branches: [custom/d3d11-video-sink]
+    branches: [custom/d3d11-video-sink, custom/audio-deadlock-hotfix]
     paths:
       - 'webrtc-sys/**'
       - 'libwebrtc/**'

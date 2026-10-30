@@ -1947,6 +1947,13 @@ impl SessionInner {
         self.closed.store(true, Ordering::Release);
         self.pc_state_notify.notify_waiters();
 
+        // Both signalling awaits below are unbounded. Close peer transports first so a
+        // cancelled or timed-out close cannot retain ICE sockets and WebRTC transports.
+        self.publisher_pc.close();
+        if let Some(ref sub_pc) = self.subscriber_pc {
+            sub_pc.close();
+        }
+
         self.signal_client
             .send(proto::signal_request::Message::Leave(proto::LeaveRequest {
                 action: proto::leave_request::Action::Disconnect.into(),
@@ -1956,10 +1963,6 @@ impl SessionInner {
             .await;
 
         self.signal_client.close().await;
-        self.publisher_pc.close();
-        if let Some(ref sub_pc) = self.subscriber_pc {
-            sub_pc.close();
-        }
     }
 
     async fn simulate_scenario(self: &Arc<Self>, scenario: SimulateScenario) -> EngineResult<()> {

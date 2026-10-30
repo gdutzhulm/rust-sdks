@@ -129,6 +129,9 @@ impl PeerTransport {
 
         if inner.renegotiate {
             inner.renegotiate = false;
+            // Backport official LiveKit fix 3ad3b8f6: create_and_send_offer reacquires
+            // the same tokio::Mutex, so the current guard must be released first.
+            drop(inner);
             self.create_and_send_offer(OfferOptions::default()).await?;
         }
 
